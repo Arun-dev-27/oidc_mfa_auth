@@ -1,7 +1,7 @@
 <h1 class="title">Verify it’s you</h1>
 {{#isOtp}}<p class="subtitle">Enter the 6-digit code sent by {{channelLabel}} to <strong>{{destination}}</strong></p>{{/isOtp}}
 {{#isTotp}}<p class="subtitle">Enter the 6-digit code from your authenticator app</p>{{/isTotp}}
-{{#isTestCode}}<p class="subtitle">Test mode: no verification method is registered for this account. Enter the static test code.</p>{{/isTestCode}}
+{{#isTestCode}}<p class="subtitle">This account has no email or phone for a code. <strong>Test mode:</strong> enter the test code <strong>{{staticCode}}</strong> to continue.</p>{{/isTestCode}}
 
 {{#error}}<div class="alert alert-error" role="alert">{{error}}</div>{{/error}}
 {{#info}}<div class="alert alert-info" role="status">{{info}}</div>{{/info}}

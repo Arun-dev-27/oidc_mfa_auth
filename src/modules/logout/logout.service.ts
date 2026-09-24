@@ -4,7 +4,7 @@ import type Redis from 'ioredis';
 import { createLocalJWKSet, decodeJwt, jwtVerify, type JWTPayload } from 'jose';
 import { AppConfig } from '../../config/config.module';
 import { requestMeta } from '../../common/request-meta';
-import { isAuthRealm, type AuthRealm } from '../../database/entities';
+import { AUTH_REALMS, isAuthRealm, type AuthRealm } from '../../database/entities';
 import { LogoutRepository } from '../../database/repositories/logout.repository';
 import { SessionParticipantRepository } from '../../database/repositories/session.repository';
 import { InjectRedis } from '../../redis/redis.module';
@@ -71,7 +71,11 @@ export class LogoutService {
   ) {}
 
   /** GET /logout */
-  async start(req: FastifyRequest, reply: FastifyReply, params: LogoutParams): Promise<void> {
+  async start(req: FastifyRequest, reply: FastifyReply, raw: LogoutParams): Promise<void> {
+    const params = withClientFromHint(raw);
+    // No client at all (address bar, bookmark, /session/end): sign out of this browser's realm sessions
+    // after a confirmation instead of failing with CLIENT_NOT_FOUND.
+    if (!params.client_id) return this.startWithoutClient(req, reply);
     const resolved = await this.resolve(params);
     if (!resolved.ok) return this.error(reply, resolved);
     const { ctx } = resolved;
@@ -101,9 +105,50 @@ export class LogoutService {
     if (!this.csrf.verify(req, CSRF_SCOPE, form.csrf)) {
       return this.error(reply, { status: 403, code: 'CSRF', message: 'This sign-out form expired. Go back to the application and sign out again.' });
     }
+    if (!form.client_id) return this.performAll(req, reply);
     const resolved = await this.resolve({ ...form, id_token_hint: undefined });
     if (!resolved.ok) return this.error(reply, resolved);
     return this.perform(req, reply, resolved.ctx);
+  }
+
+  /** Realms this browser has an active Core session in. */
+  private async activeRealms(req: FastifyRequest): Promise<AuthRealm[]> {
+    const active: AuthRealm[] = [];
+    for (const realm of AUTH_REALMS) if (await this.sessions.read(realm, req)) active.push(realm);
+    return active;
+  }
+
+  /** GET /logout without a client: confirm, then end every realm session of this browser. */
+  private async startWithoutClient(req: FastifyRequest, reply: FastifyReply): Promise<void> {
+    const realms = await this.activeRealms(req);
+    if (!realms.length) return this.send(reply, 200, 'logged-out', { title: 'Signed out', realmLabel: 'Miqaat' });
+    return this.send(reply, 200, 'logout', {
+      title: 'Sign out',
+      realmLabel: realms.map(realmLabel).join(' and '),
+      clientName: 'Miqaat',
+      csrf: this.csrf.issue(req, reply, CSRF_SCOPE),
+      clientId: '',
+      redirectUri: '',
+      state: '',
+      cancelUrl: '',
+    });
+  }
+
+  /** POST /logout/confirm without a client (CSRF already checked): same processing per realm. */
+  private async performAll(req: FastifyRequest, reply: FastifyReply): Promise<void> {
+    const ended: AuthRealm[] = [];
+    for (const realm of await this.activeRealms(req)) {
+      const revoked = await this.sessions.revoke(realm, req, reply, 'USER_LOGOUT');
+      if (!revoked) continue;
+      ended.push(realm);
+      try {
+        await this.endSession(revoked, null, 'USER_LOGOUT', requestMeta(req));
+      } catch (error) {
+        this.logger.error(`logout follow-up failed for sid ${revoked.sid}: ${error instanceof Error ? error.message : String(error)}`);
+        await this.audit.record({ eventType: 'LOGOUT_FOLLOWUP_FAILED', outcome: 'FAILURE', itsId: revoked.itsId, sid: revoked.sid, clientId: null });
+      }
+    }
+    return this.send(reply, 200, 'logged-out', { title: 'Signed out', realmLabel: ended.length ? ended.map(realmLabel).join(' and ') : 'Miqaat' });
   }
 
   private async perform(req: FastifyRequest, reply: FastifyReply, ctx: LogoutContext): Promise<void> {
@@ -218,6 +263,21 @@ export class LogoutService {
 
   private send(reply: FastifyReply, status: number, view: string, data: Record<string, string | number | boolean>) {
     return reply.code(status).header('content-type', 'text/html; charset=utf-8').header('cache-control', 'no-store').send(this.views.render(view, data));
+  }
+}
+
+/**
+ * OpenID Connect allows id_token_hint without client_id: the client is the token's audience. The hint is
+ * still fully verified against that client in resolve().
+ */
+function withClientFromHint(params: LogoutParams): LogoutParams {
+  if (params.client_id || typeof params.id_token_hint !== 'string' || !params.id_token_hint) return params;
+  try {
+    const aud = decodeJwt(params.id_token_hint).aud;
+    const clientId = Array.isArray(aud) ? aud[0] : aud;
+    return typeof clientId === 'string' ? { ...params, client_id: clientId } : params;
+  } catch {
+    return params;
   }
 }
 

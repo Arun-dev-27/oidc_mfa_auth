@@ -1024,7 +1024,7 @@ const SCENARIOS=[
  ['Wrong password','"Incorrect ITS ID or password."'],
  ['Member 10110106','"You are not eligible…" (turn LOGIN_ELIGIBILITY_CHECK_ENABLED=false to allow)'],
  ['Member 10110108','"Your account cannot sign in at the moment…"'],
- ['Member 10110102 with "Sign in + MFA"','Explains no verification method is registered'],
+ ['Member 10110102 (no email / phone) with "Sign in + MFA"','With MFA_STATIC_OTP: MFA page shows the test code (123456) -> enter it -> aal:2. Without it: page explains no verification method is registered'],
  ['"Cancel" on the login page','App card shows access_denied'],
  ['Sign in to RMS Admin + AMS Admin + RMS Mumin, then "Logout" on RMS Admin','Back on console; RMS + AMS cards signed out (AMS by back-channel), MUMIN still signed in; ADMIN session REVOKED'],
  ['After that logout, "Sign in" on AMS Admin','Login page again (no SSO - the ADMIN session is gone)'],

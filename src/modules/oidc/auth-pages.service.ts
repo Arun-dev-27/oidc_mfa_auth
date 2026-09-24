@@ -70,6 +70,8 @@ export class AuthPagesService {
       isTotp: option.method === 'TOTP',
       // MFA_STATIC_OTP testing step for a member without any method (nothing is sent).
       isTestCode: option.method !== 'TOTP' && option.destination === null,
+      // Only ever non-empty when MFA_STATIC_OTP is set (refused in production).
+      staticCode: this.config.env.MFA_STATIC_OTP,
       isOtp: option.method !== 'TOTP' && option.destination !== null,
       destination: option.masked,
       channelLabel: option.label,
