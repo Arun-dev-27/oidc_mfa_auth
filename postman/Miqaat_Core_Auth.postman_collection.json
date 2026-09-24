@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Miqaat Core Auth (oidc_mfa_auth)",
-    "description": "Core authentication service: discovery, Authorization Code + PKCE sign-in with the SSR login and MFA pages, token exchange with **client_secret_basic**, /me, trusted handoff, refused client authentication cases and realm-wide logout.\n\n**Run it:** start the service (`npm start`, :4000) and the Test Console (`npm run console`, :5170), set `MFA_STATIC_OTP=123456` in .env (or put the real code into `mfa_code`), then run the whole collection in the Collection Runner or `npx newman run postman/Miqaat_Core_Auth.postman_collection.json`. Folder 0 registers the client `postman-dev` (or issues it a new secret) and fills `client_id` / `client_secret`.\n\n**Variables:** `its_id` / `password` = the member to sign in (local test data), `acr_values` = aal:2 (MFA) or aal:1, `handoff_target` / `handoff_path` = the app and page to open. Development only.",
+    "description": "Core authentication service: discovery, Authorization Code + PKCE sign-in with the SSR login and MFA pages, token exchange with **client_secret_basic**, /me, trusted handoff, refused client authentication cases and realm-wide logout.\n\n**Run it:** start the service (`npm start`, :4000) and the Test Console (`npm run console`, :5170), set `MFA_STATIC_OTP=123456` in .env (or put the real code into `mfa_code`), then run the whole collection in the Collection Runner or `npx newman run postman/Miqaat_Core_Auth.postman_collection.json`. Folder 0 registers the client `postman-dev` (or issues it a new secret) and fills `client_id` / `client_secret`.\n\n**Variables:** `its_id` / `password` = the member to sign in (local test data), `acr_values` = aal:2 (MFA) or aal:1, `handoff_target` / `handoff_path` = the app and page to open. For a hosted deployment set `issuer`, `console` and `console_password` (the Test Console password). Development / test environments only.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
@@ -17,7 +17,19 @@
           "request": {
             "method": "POST",
             "auth": {
-              "type": "noauth"
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{console_user}}",
+                  "type": "string"
+                },
+                {
+                  "key": "password",
+                  "value": "{{console_password}}",
+                  "type": "string"
+                }
+              ]
             },
             "header": [
               {
@@ -47,7 +59,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "",
-                  "const v = (k) => pm.collectionVariables.get(k);",
+                  "// Reads resolve environment > collection, so --env-var / a Postman environment can override issuer, console ...",
+                  "const v = (k) => pm.variables.get(k);",
                   "const set = (k, val) => pm.collectionVariables.set(k, val);",
                   "const next = (name) => pm.execution.setNextRequest(name);",
                   "const CJS = require('crypto-js');",
@@ -83,7 +96,19 @@
           "request": {
             "method": "POST",
             "auth": {
-              "type": "noauth"
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{console_user}}",
+                  "type": "string"
+                },
+                {
+                  "key": "password",
+                  "value": "{{console_password}}",
+                  "type": "string"
+                }
+              ]
             },
             "header": [
               {
@@ -113,7 +138,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "",
-                  "const v = (k) => pm.collectionVariables.get(k);",
+                  "// Reads resolve environment > collection, so --env-var / a Postman environment can override issuer, console ...",
+                  "const v = (k) => pm.variables.get(k);",
                   "const set = (k, val) => pm.collectionVariables.set(k, val);",
                   "const next = (name) => pm.execution.setNextRequest(name);",
                   "const CJS = require('crypto-js');",
@@ -142,7 +168,19 @@
           "request": {
             "method": "GET",
             "auth": {
-              "type": "noauth"
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{console_user}}",
+                  "type": "string"
+                },
+                {
+                  "key": "password",
+                  "value": "{{console_password}}",
+                  "type": "string"
+                }
+              ]
             },
             "header": [],
             "url": "{{console}}/api/clients"
@@ -154,7 +192,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "",
-                  "const v = (k) => pm.collectionVariables.get(k);",
+                  "// Reads resolve environment > collection, so --env-var / a Postman environment can override issuer, console ...",
+                  "const v = (k) => pm.variables.get(k);",
                   "const set = (k, val) => pm.collectionVariables.set(k, val);",
                   "const next = (name) => pm.execution.setNextRequest(name);",
                   "const CJS = require('crypto-js');",
@@ -197,7 +236,7 @@
                 "type": "text/javascript",
                 "exec": [
                   "const d = pm.response.json();",
-                  "pm.test('200 and issuer', () => { pm.expect(pm.response.code).to.eql(200); pm.expect(d.issuer).to.eql(pm.collectionVariables.get('issuer')); });",
+                  "pm.test('200 and issuer', () => { pm.expect(pm.response.code).to.eql(200); pm.expect(d.issuer).to.eql(pm.variables.get('issuer')); });",
                   "pm.test('Authorization Code + PKCE S256 only', () => { pm.expect(d.response_types_supported).to.eql(['code']); pm.expect(d.code_challenge_methods_supported).to.eql(['S256']); });",
                   "pm.test('client authentication: client_secret_basic', () => pm.expect(d.token_endpoint_auth_methods_supported).to.include('client_secret_basic'));",
                   "pm.test('RS256 ID tokens, acr aal:1 / aal:2', () => { pm.expect(d.id_token_signing_alg_values_supported).to.eql(['RS256']); pm.expect(d.acr_values_supported).to.include('urn:miqaat:aal:2'); });"
@@ -313,7 +352,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "",
-                  "const v = (k) => pm.collectionVariables.get(k);",
+                  "// Reads resolve environment > collection, so --env-var / a Postman environment can override issuer, console ...",
+                  "const v = (k) => pm.variables.get(k);",
                   "const set = (k, val) => pm.collectionVariables.set(k, val);",
                   "const next = (name) => pm.execution.setNextRequest(name);",
                   "const CJS = require('crypto-js');",
@@ -338,7 +378,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "",
-                  "const v = (k) => pm.collectionVariables.get(k);",
+                  "// Reads resolve environment > collection, so --env-var / a Postman environment can override issuer, console ...",
+                  "const v = (k) => pm.variables.get(k);",
                   "const set = (k, val) => pm.collectionVariables.set(k, val);",
                   "const next = (name) => pm.execution.setNextRequest(name);",
                   "const CJS = require('crypto-js');",
@@ -410,7 +451,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "",
-                  "const v = (k) => pm.collectionVariables.get(k);",
+                  "// Reads resolve environment > collection, so --env-var / a Postman environment can override issuer, console ...",
+                  "const v = (k) => pm.variables.get(k);",
                   "const set = (k, val) => pm.collectionVariables.set(k, val);",
                   "const next = (name) => pm.execution.setNextRequest(name);",
                   "const CJS = require('crypto-js');",
@@ -507,7 +549,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "",
-                  "const v = (k) => pm.collectionVariables.get(k);",
+                  "// Reads resolve environment > collection, so --env-var / a Postman environment can override issuer, console ...",
+                  "const v = (k) => pm.variables.get(k);",
                   "const set = (k, val) => pm.collectionVariables.set(k, val);",
                   "const next = (name) => pm.execution.setNextRequest(name);",
                   "const CJS = require('crypto-js');",
@@ -609,7 +652,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "",
-                  "const v = (k) => pm.collectionVariables.get(k);",
+                  "// Reads resolve environment > collection, so --env-var / a Postman environment can override issuer, console ...",
+                  "const v = (k) => pm.variables.get(k);",
                   "const set = (k, val) => pm.collectionVariables.set(k, val);",
                   "const next = (name) => pm.execution.setNextRequest(name);",
                   "const CJS = require('crypto-js');",
@@ -718,7 +762,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "",
-                  "const v = (k) => pm.collectionVariables.get(k);",
+                  "// Reads resolve environment > collection, so --env-var / a Postman environment can override issuer, console ...",
+                  "const v = (k) => pm.variables.get(k);",
                   "const set = (k, val) => pm.collectionVariables.set(k, val);",
                   "const next = (name) => pm.execution.setNextRequest(name);",
                   "const CJS = require('crypto-js');",
@@ -784,8 +829,8 @@
                   "const b = pm.response.json();",
                   "pm.test('200: sub, auth_realm, sid, name', () => {",
                   "  pm.expect(pm.response.code).to.eql(200);",
-                  "  pm.expect(b.sub).to.eql(pm.collectionVariables.get('its_id'));",
-                  "  pm.expect(b.sid).to.eql(pm.collectionVariables.get('sid'));",
+                  "  pm.expect(b.sub).to.eql(pm.variables.get('its_id'));",
+                  "  pm.expect(b.sid).to.eql(pm.variables.get('sid'));",
                   "  pm.expect(b.auth_realm).to.be.a('string');",
                   "});"
                 ]
@@ -847,7 +892,7 @@
                   "const b = pm.response.json();",
                   "pm.test('201: request id + one-time browser URL on Core', () => {",
                   "  pm.expect(pm.response.code, JSON.stringify(b)).to.eql(201);",
-                  "  pm.expect(b.browser_redirect_url).to.eql(pm.collectionVariables.get('issuer') + '/v1/handoff/' + b.handoff_request_id);",
+                  "  pm.expect(b.browser_redirect_url).to.eql(pm.variables.get('issuer') + '/v1/handoff/' + b.handoff_request_id);",
                   "});",
                   "pm.collectionVariables.set('handoff_url', b.browser_redirect_url);"
                 ]
@@ -875,7 +920,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "",
-                  "const v = (k) => pm.collectionVariables.get(k);",
+                  "// Reads resolve environment > collection, so --env-var / a Postman environment can override issuer, console ...",
+                  "const v = (k) => pm.variables.get(k);",
                   "const set = (k, val) => pm.collectionVariables.set(k, val);",
                   "const next = (name) => pm.execution.setNextRequest(name);",
                   "const CJS = require('crypto-js');",
@@ -1342,7 +1388,7 @@
                   "const loc = pm.response.headers.get('Location') || '';",
                   "pm.test('redirect to the post-logout URI with state (no confirmation page)', () => {",
                   "  pm.expect(pm.response.code).to.be.within(300, 399);",
-                  "  pm.expect(loc.startsWith(pm.collectionVariables.get('post_logout_redirect_uri'))).to.eql(true);",
+                  "  pm.expect(loc.startsWith(pm.variables.get('post_logout_redirect_uri'))).to.eql(true);",
                   "  pm.expect(loc).to.include('state=postman-logout');",
                   "});"
                 ]
@@ -1402,7 +1448,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "",
-                  "const v = (k) => pm.collectionVariables.get(k);",
+                  "// Reads resolve environment > collection, so --env-var / a Postman environment can override issuer, console ...",
+                  "const v = (k) => pm.variables.get(k);",
                   "const set = (k, val) => pm.collectionVariables.set(k, val);",
                   "const next = (name) => pm.execution.setNextRequest(name);",
                   "const CJS = require('crypto-js');",
@@ -1444,6 +1491,16 @@
     {
       "key": "console",
       "value": "http://localhost:5170",
+      "type": "string"
+    },
+    {
+      "key": "console_user",
+      "value": "tester",
+      "type": "string"
+    },
+    {
+      "key": "console_password",
+      "value": "",
       "type": "string"
     },
     {

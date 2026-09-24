@@ -16,7 +16,20 @@ import { loadDotEnv } from '../src/config/env';
 loadDotEnv();
 if (process.env.NODE_ENV === 'production') throw new Error('development only');
 
-const CONSOLE = `http://localhost:${process.env.CONSOLE_PORT ?? 5170}`;
+/**
+ * Local by default. Against a hosted deployment (e.g. Render):
+ *   CONSOLE_URL=https://<console> CONSOLE_AUTH=user:password ISSUER=https://<core> npm run test:browser
+ * (DB_* must then point at that deployment's database for the few database checks.)
+ */
+const CONSOLE = (process.env.CONSOLE_URL || `http://localhost:${process.env.CONSOLE_PORT ?? 5170}`).replace(/\/+$/, '');
+const CORE = (process.env.ISSUER || 'http://localhost:4000').replace(/\/+$/, '');
+const HOSTED = Boolean(process.env.CONSOLE_URL);
+const AMS = HOSTED ? `${CONSOLE}/app/ams-admin` : 'http://localhost:5174';
+const CONSOLE_AUTH = process.env.CONSOLE_AUTH || '';
+const authHeader: Record<string, string> = CONSOLE_AUTH ? { authorization: `Basic ${Buffer.from(CONSOLE_AUTH).toString('base64')}` } : {};
+/** fetch to the console, with its password when it has one. */
+const cfetch = (url: string, init: RequestInit = {}) => fetch(url, { ...init, headers: { ...authHeader, ...(init.headers as Record<string, string> | undefined) } });
+const CTX = CONSOLE_AUTH ? { httpCredentials: { username: CONSOLE_AUTH.split(':')[0], password: CONSOLE_AUTH.slice(CONSOLE_AUTH.indexOf(':') + 1) } } : {};
 const headed = process.argv.includes('--headed');
 let failures = 0;
 const check = (name: string, ok: boolean, detail = '') => {
@@ -25,7 +38,7 @@ const check = (name: string, ok: boolean, detail = '') => {
 };
 
 async function state() {
-  return (await (await fetch(`${CONSOLE}/api/state`)).json()) as {
+  return (await (await cfetch(`${CONSOLE}/api/state`)).json()) as {
     apps: { key: string; session: { claims: Record<string, unknown> } | null; lastError: string | null }[];
     outbox: { code: string; at: string }[];
     members: { itsId: string; password: string }[];
@@ -33,6 +46,7 @@ async function state() {
 }
 
 async function latestCodeAfter(since: number): Promise<string> {
+  if (process.env.MFA_STATIC_OTP?.trim()) return process.env.MFA_STATIC_OTP.trim();
   for (let i = 0; i < 40; i++) {
     const o = (await state()).outbox.find((x) => Date.parse(x.at) >= since - 1000);
     if (o) return o.code;
@@ -93,6 +107,7 @@ async function dbQuery(sql: string, params: unknown[]): Promise<unknown[]> {
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     options: `-c search_path=${process.env.DB_SCHEMA}`,
+    ssl: ['true', '1'].includes(process.env.DB_SSL ?? '') ? { rejectUnauthorized: true } : undefined,
   });
   try {
     return (await pool.query(sql, params)).rows;
@@ -111,11 +126,11 @@ async function alertText(page: Page) {
 async function main() {
   const members = (await state()).members;
   const pw = (id: string) => members.find((m) => m.itsId === id)!.password;
-  for (const key of ['rms-admin', 'ams-admin', 'rms-mumin']) await fetch(`${CONSOLE}/api/clear?app=${key}`);
+  for (const key of ['rms-admin', 'ams-admin', 'rms-mumin']) await cfetch(`${CONSOLE}/api/clear?app=${key}`);
 
   const browser = await chromium.launch({ channel: process.env.BROWSER_CHANNEL ?? 'msedge', headless: !headed });
   try {
-    const page = await (await browser.newContext()).newPage();
+    const page = await (await browser.newContext(CTX)).newPage();
 
     console.log('\n=== Real browser: login + MFA, SSO, realm isolation');
     const r1 = await signIn(page, 'rms-admin', 'Sign in + MFA (AAL2)', '10110101', pw('10110101'));
@@ -127,10 +142,11 @@ async function main() {
     check('RMS Mumin: login + MFA again, realm MUMIN, other sid', r3.seen.join(',') === 'login,mfa' && r3.claims?.auth_realm === 'MUMIN' && r3.claims?.sid !== r1.claims?.sid);
 
     console.log('\n=== Real browser: form behaviour');
-    const fresh = await (await browser.newContext()).newPage();
+    const fresh = await (await browser.newContext(CTX)).newPage();
     await fresh.goto(`${CONSOLE}/`);
     await fresh.locator('#rms-admin').getByRole('link', { name: 'Sign in (AAL1)', exact: true }).click();
     await fresh.waitForSelector('#its_id');
+    await fresh.waitForLoadState('load'); // auth.js (progressive enhancement) must have run
     check('Login button disabled until both fields are filled', await fresh.isDisabled('button[data-submit]'));
     await fresh.fill('#its_id', '10110101');
     await fresh.fill('#password', 'wrong-password');
@@ -145,7 +161,7 @@ async function main() {
     const aal1 = (await state()).apps.find((a) => a.key === 'rms-admin')!.session?.claims;
     check('Retry with the right password on the same form -> signed in (AAL1)', aal1?.acr === 'urn:miqaat:aal:1');
 
-    const mfaPage = await (await browser.newContext()).newPage();
+    const mfaPage = await (await browser.newContext(CTX)).newPage();
     await mfaPage.goto(`${CONSOLE}/`);
     await mfaPage.locator('#rms-admin').getByRole('link', { name: 'Sign in + MFA (AAL2)', exact: true }).click();
     await mfaPage.fill('#its_id', '10110101');
@@ -164,8 +180,8 @@ async function main() {
 
     // ---- logout ------------------------------------------------------------------------------
     console.log('\n=== Real browser: realm-wide logout');
-    for (const key of ['rms-admin', 'ams-admin', 'rms-mumin']) await fetch(`${CONSOLE}/api/clear?app=${key}`);
-    const lb = await (await browser.newContext()).newPage();
+    for (const key of ['rms-admin', 'ams-admin', 'rms-mumin']) await cfetch(`${CONSOLE}/api/clear?app=${key}`);
+    const lb = await (await browser.newContext(CTX)).newPage();
     const a1 = await signIn(lb, 'rms-admin', 'Sign in + MFA (AAL2)', '10110101', pw('10110101'));
     const a2 = await signIn(lb, 'ams-admin', 'Sign in + MFA (AAL2)', '10110101', pw('10110101'));
     const m1 = await signIn(lb, 'rms-mumin', 'Sign in (AAL1)', '10110101', pw('10110101'));
@@ -186,9 +202,9 @@ async function main() {
     // The BU may clear its session a moment before Core records the 200, so wait for the final status.
     const deliveries =
       (await waitFor(async () => {
-        const l = ((await (await fetch(`${CONSOLE}/api/state`)).json()) as { logout: { client_id: string; status: string }[] }).logout;
+        const l = ((await (await cfetch(`${CONSOLE}/api/state`)).json()) as { logout: { client_id: string; status: string }[] }).logout;
         return ['rms-admin-dev', 'ams-admin-dev'].every((c) => l.some((d) => d.client_id === c && d.status === 'SUCCEEDED')) ? l : null;
-      })) ?? ((await (await fetch(`${CONSOLE}/api/state`)).json()) as { logout: { client_id: string; status: string }[] }).logout;
+      })) ?? ((await (await cfetch(`${CONSOLE}/api/state`)).json()) as { logout: { client_id: string; status: string }[] }).logout;
     check('Deliveries: RMS Admin + AMS Admin SUCCEEDED, none to MUMIN',
       ['rms-admin-dev', 'ams-admin-dev'].every((c) => deliveries.some((d) => d.client_id === c && d.status === 'SUCCEEDED')) && !deliveries.some((d) => d.client_id === 'rms-mumin-dev'),
       JSON.stringify(deliveries.slice(0, 3)));
@@ -198,7 +214,7 @@ async function main() {
     check('RMS Mumin still signs in silently', mumin.seen.length === 0, mumin.seen.join(','));
 
     // Logout with no local session -> Core asks to confirm.
-    await fetch(`${CONSOLE}/api/clear?app=ams-admin`);
+    await cfetch(`${CONSOLE}/api/clear?app=ams-admin`);
     await lb.goto(`${CONSOLE}/`);
     await lb.locator('#ams-admin').getByRole('link', { name: /^Logout/ }).click();
     await lb.waitForSelector('text=Sign out?');
@@ -208,21 +224,21 @@ async function main() {
     check('After confirming, the ADMIN session is gone', confirmed.seen[0] === 'login', confirmed.seen.join(','));
 
     // Back-channel endpoint down -> Core retries until it is back.
-    const rb = await (await browser.newContext()).newPage();
-    for (const key of ['rms-admin', 'ams-admin']) await fetch(`${CONSOLE}/api/clear?app=${key}`);
+    const rb = await (await browser.newContext(CTX)).newPage();
+    for (const key of ['rms-admin', 'ams-admin']) await cfetch(`${CONSOLE}/api/clear?app=${key}`);
     await signIn(rb, 'rms-admin', 'Sign in (AAL1)', '10110101', pw('10110101'));
     await signIn(rb, 'ams-admin', 'Sign in (AAL1)', '10110101', pw('10110101'));
-    await fetch(`${CONSOLE}/api/backchannel?app=ams-admin&down=1`);
+    await cfetch(`${CONSOLE}/api/backchannel?app=ams-admin&down=1`);
     await rb.goto(`${CONSOLE}/`);
     await Promise.all([rb.waitForURL((u) => u.toString().startsWith(CONSOLE), { timeout: 15_000 }), rb.locator('#rms-admin').getByRole('link', { name: /^Logout/ }).click()]);
     const retrying = await waitFor(async () => {
-      const l = ((await (await fetch(`${CONSOLE}/api/state`)).json()) as { logout: { client_id: string; status: string }[] }).logout;
+      const l = ((await (await cfetch(`${CONSOLE}/api/state`)).json()) as { logout: { client_id: string; status: string }[] }).logout;
       return l.find((d) => d.client_id === 'ams-admin-dev' && d.status === 'RETRY') ?? null;
     });
     check('AMS endpoint down (503) -> delivery marked RETRY', Boolean(retrying));
-    await fetch(`${CONSOLE}/api/backchannel?app=ams-admin&down=0`);
+    await cfetch(`${CONSOLE}/api/backchannel?app=ams-admin&down=0`);
     const recovered = await waitFor(async () => {
-      const l = ((await (await fetch(`${CONSOLE}/api/state`)).json()) as { logout: { client_id: string; status: string; attempt_count: number }[] }).logout;
+      const l = ((await (await cfetch(`${CONSOLE}/api/state`)).json()) as { logout: { client_id: string; status: string; attempt_count: number }[] }).logout;
       const d = l.find((x) => x.client_id === 'ams-admin-dev');
       return d && d.status === 'SUCCEEDED' ? d : null;
     }, 20_000);
@@ -230,8 +246,8 @@ async function main() {
 
     // ---- trusted handoff ---------------------------------------------------------------------
     console.log('\n=== Real browser: trusted handoff (RMS Admin -> AMS Admin)');
-    for (const key of ['rms-admin', 'ams-admin', 'rms-mumin']) await fetch(`${CONSOLE}/api/clear?app=${key}`);
-    const hb = await (await browser.newContext()).newPage();
+    for (const key of ['rms-admin', 'ams-admin', 'rms-mumin']) await cfetch(`${CONSOLE}/api/clear?app=${key}`);
+    const hb = await (await browser.newContext(CTX)).newPage();
     const src = await signIn(hb, 'rms-admin', 'Sign in (AAL1)', '10110101', pw('10110101'));
     let assertion = '';
     hb.on('request', (r) => {
@@ -243,30 +259,30 @@ async function main() {
       await form.locator('select[name="target"]').selectOption(target);
       await form.locator('select[name="path"]').selectOption(path);
       await Promise.all([hb.waitForLoadState('load'), form.getByRole('button', { name: 'Open via handoff' }).click()]);
-      await hb.waitForURL((u) => !u.toString().startsWith('http://localhost:4000'), { timeout: 15_000 });
+      await hb.waitForURL((u) => !u.toString().startsWith(CORE), { timeout: 15_000 });
     };
     await handoff('ams-admin', '/events/123');
-    check('Handoff lands on AMS Admin /events/123 (no login page, auto-POST)', hb.url() === 'http://localhost:5174/events/123', hb.url());
+    check('Handoff lands on AMS Admin /events/123 (no login page, auto-POST)', hb.url() === `${AMS}/events/123`, hb.url());
     check('Landing page says it arrived by trusted handoff', (await hb.locator('main').innerText()).includes('trusted handoff'));
     const ams = (await state()).apps.find((a) => a.key === 'ams-admin')!.session?.claims;
     check('AMS Admin local session: same ITS ID and Core sid as RMS Admin', ams?.sub === '10110101' && ams?.sid === src.claims?.sid && ams?.source_client_id === 'rms-admin-dev');
-    const replay = await fetch('http://localhost:5174/auth/core/handoff', { method: 'POST', body: new URLSearchParams({ assertion }), redirect: 'manual' });
+    const replay = await fetch(`${AMS}/auth/core/handoff`, { method: 'POST', body: new URLSearchParams({ assertion }), redirect: 'manual' });
     check('Replaying the captured assertion -> 400 HANDOFF_REPLAYED', replay.status === 400 && (await replay.text()).includes('HANDOFF_REPLAYED'));
     const [h, p, s] = assertion.split('.');
     const forged = `${h}.${Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(p, 'base64url').toString()), sub: '10110102' })).toString('base64url')}.${s}`;
-    const tampered = await fetch('http://localhost:5174/auth/core/handoff', { method: 'POST', body: new URLSearchParams({ assertion: forged }), redirect: 'manual' });
+    const tampered = await fetch(`${AMS}/auth/core/handoff`, { method: 'POST', body: new URLSearchParams({ assertion: forged }), redirect: 'manual' });
     check('Tampered assertion (sub changed) -> 400 HANDOFF_SIGNATURE_INVALID', tampered.status === 400 && (await tampered.text()).includes('HANDOFF_SIGNATURE_INVALID'));
     await handoff('ams-admin', '/admin/users');
     check('Handoff to /admin/users: target authorization denies it (403 page)', (await hb.locator('h2').innerText()).includes('Access denied'));
     await handoff('rms-mumin', '/events/123');
-    const events = ((await (await fetch(`${CONSOLE}/api/state`)).json()) as { apps: { key: string; events: { text: string }[] }[] }).apps.find((a) => a.key === 'rms-admin')!.events;
+    const events = ((await (await cfetch(`${CONSOLE}/api/state`)).json()) as { apps: { key: string; events: { text: string }[] }[] }).apps.find((a) => a.key === 'rms-admin')!.events;
     check('ADMIN -> MUMIN handoff refused by Core (REALM_MISMATCH), browser back on console', hb.url().startsWith(CONSOLE) && events.some((e) => e.text.includes('REALM_MISMATCH')), events[0]?.text);
 
     // ---- a client registered in the UI, tested end to end through the console test app ----------
     console.log('\n=== Real browser: register a new client in the UI and test everything with it');
     await deleteUiClient();
-    for (const key of ['rms-admin', 'ams-admin', 'rms-mumin']) await fetch(`${CONSOLE}/api/clear?app=${key}`);
-    const cp = await (await browser.newContext()).newPage();
+    for (const key of ['rms-admin', 'ams-admin', 'rms-mumin']) await cfetch(`${CONSOLE}/api/clear?app=${key}`);
+    const cp = await (await browser.newContext(CTX)).newPage();
     cp.on('dialog', (d) => void d.accept());
     const USER = '10110105';
     const TEST_APP = `${CONSOLE}/try?client_id=${UI_CLIENT}`;
@@ -277,7 +293,7 @@ async function main() {
       let since = Date.now() - 2000;
       for (let i = 0; i < 4; i++) {
         await cp.waitForLoadState('load');
-        if (!cp.url().startsWith('http://localhost:4000')) break;
+        if (!cp.url().startsWith(CORE)) break;
         if (await cp.locator('#its_id').count()) {
           seen.push('login');
           await cp.fill('#its_id', USER);
@@ -349,19 +365,22 @@ async function main() {
     await cp.goto(TEST_APP);
     await cp.locator('form[action="/try/handoff-out"] select[name="target"]').selectOption('ams-admin-dev');
     await cp.locator('form[action="/try/handoff-out"] select[name="path"]').selectOption('/events/123');
-    await Promise.all([cp.waitForURL((u) => u.toString().startsWith('http://localhost:5174/'), { timeout: 15_000 }), cp.getByRole('button', { name: 'Open via handoff' }).click()]);
+    await Promise.all([cp.waitForURL((u) => u.toString().startsWith(`${AMS}/`), { timeout: 15_000 }), cp.getByRole('button', { name: 'Open via handoff' }).click()]);
     const landed = (await cp.locator('main').innerText()).replace(/\s+/g, ' ');
-    check('Handoff out: lands on AMS Admin /events/123, arrived from the new client, no login', cp.url() === 'http://localhost:5174/events/123' && landed.includes(UI_CLIENT) && landed.includes('trusted handoff'), `${cp.url()} ${landed.slice(0, 160)}`);
+    check('Handoff out: lands on AMS Admin /events/123, arrived from the new client, no login', cp.url() === `${AMS}/events/123` && landed.includes(UI_CLIENT) && landed.includes('trusted handoff'), `${cp.url()} ${landed.slice(0, 160)}`);
 
     // 7. Handoff IN: RMS Admin -> new client.
     await cp.goto(TEST_APP);
-    await Promise.all([cp.waitForURL((u) => u.toString().startsWith(TEST_APP), { timeout: 15_000 }), cp.getByRole('link', { name: 'RMS Admin', exact: true }).click()]);
+    // The browser already is on the test app: wait for the result, not for the URL.
+    await cp.getByRole('link', { name: 'RMS Admin', exact: true }).click();
+    await cp.getByText('Handoff from rms-admin-dev verified').first().waitFor({ timeout: 30_000 }).catch(() => undefined);
     m = await main();
     check('Handoff in: RMS Admin opens /dashboard of the new client, assertion verified, no password', m.includes('Handoff from rms-admin-dev verified') && m.includes('via handoff from rms-admin-dev'), m.slice(0, 300));
 
     // 8. Handoff to the other realm is refused.
     await cp.locator('form[action="/try/handoff-out"] select[name="target"]').selectOption('rms-mumin-dev');
-    await Promise.all([cp.waitForURL((u) => u.toString().startsWith(TEST_APP), { timeout: 15_000 }), cp.getByRole('button', { name: 'Open via handoff' }).click()]);
+    await cp.getByRole('button', { name: 'Open via handoff' }).click();
+    await cp.getByText('REALM_MISMATCH').first().waitFor({ timeout: 30_000 }).catch(() => undefined);
     check('Handoff to a MUMIN app -> refused by Core (REALM_MISMATCH)', (await main()).includes('REALM_MISMATCH'));
 
     // 9. Logout from the new client: realm-wide, back-channel to the new client and AMS Admin.
@@ -396,7 +415,7 @@ async function main() {
     await cp.waitForFunction(`(document.getElementById('newsecret')?.textContent ?? '${secret1}') !== '${secret1}'`);
     const secret2 = (await cp.locator('#newsecret').innerText()).trim();
     const tokenWith = async (secret: string) =>
-      (await fetch('http://localhost:4000/token', {
+      (await fetch(`${CORE}/token`, {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: `Basic ${Buffer.from(`${UI_CLIENT}:${secret}`).toString('base64')}` },
         body: new URLSearchParams({ grant_type: 'authorization_code', code: 'not-a-code', redirect_uri: `${CONSOLE}/try/callback`, code_verifier: 'x'.repeat(43) }),
@@ -413,7 +432,7 @@ async function main() {
     await cp.waitForSelector(`#clientrows tr:has-text("${UI_CLIENT}") >> text=SUSPENDED`);
     await cp.goto(`${CONSOLE}/try/login?client_id=${UI_CLIENT}`);
     await cp.waitForLoadState('load');
-    check('Suspended -> Core refuses the client (stays on a Core error page)', cp.url().startsWith('http://localhost:4000') && !(await cp.locator('body').innerText()).includes('Signed in'), cp.url());
+    check('Suspended -> Core refuses the client (stays on a Core error page)', cp.url().startsWith(CORE) && !(await cp.locator('body').innerText()).includes('Signed in'), cp.url());
     check('Suspended -> the secret no longer authenticates at /token', (await tokenWith(secret2)).error === 'invalid_client');
     await cp.goto(`${CONSOLE}/#clients`);
     await cp.waitForSelector(`#clientrows tr:has-text("${UI_CLIENT}")`);
@@ -423,7 +442,7 @@ async function main() {
     await click('Sign in (AAL1)');
     await throughCore();
     check('Activate -> signs in again', (await main()).includes(`Signed in as ITS ${USER}`));
-    const crossSite = await fetch(`${CONSOLE}/api/clients`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-test-console': '1', origin: 'https://evil.example' }, body: '{}' });
+    const crossSite = await cfetch(`${CONSOLE}/api/clients`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-test-console': '1', origin: 'https://evil.example' }, body: '{}' });
     check('Registration API refuses requests from another origin (403)', crossSite.status === 403);
     await deleteUiClient();
 
@@ -437,8 +456,8 @@ async function main() {
         ['10110103', 'TOTP member'],
         ['10110102', 'member without any MFA method'],
       ] as const) {
-        await fetch(`${CONSOLE}/api/clear?app=rms-admin`);
-        const sp = await (await browser.newContext()).newPage();
+        await cfetch(`${CONSOLE}/api/clear?app=rms-admin`);
+        const sp = await (await browser.newContext(CTX)).newPage();
         await sp.goto(`${CONSOLE}/`);
         await sp.locator('#rms-admin').getByRole('link', { name: 'Sign in + MFA (AAL2)', exact: true }).click();
         await sp.fill('#its_id', itsId);
@@ -454,7 +473,7 @@ async function main() {
   } finally {
     await browser.close();
   }
-  for (const key of ['rms-admin', 'ams-admin', 'rms-mumin']) await fetch(`${CONSOLE}/api/clear?app=${key}`);
+  for (const key of ['rms-admin', 'ams-admin', 'rms-mumin']) await cfetch(`${CONSOLE}/api/clear?app=${key}`);
   console.log(`\nRESULT: ${failures === 0 ? 'all browser checks passed' : `${failures} failed`}`);
   process.exit(failures ? 1 : 0);
 }

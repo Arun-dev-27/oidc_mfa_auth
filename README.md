@@ -347,6 +347,34 @@ the demo target authorization; a MUMIN target is refused by Core with `REALM_MIS
 * The API behind it only accepts JSON requests from the console page (custom header + Origin check), so
   another web site cannot register clients through your browser. There is no delete.
 
+## Hosted test environment (Render)
+
+A **test / demo** deployment (development mode: static test OTP, outbox mail, file signing key — not the
+production setup, which needs KMS and a real mail / SMS provider):
+
+| Render resource | What |
+|---|---|
+| `miqaat-core-auth` (web, Node) | Core: build `npm ci && npm run build`, start `node dist/main.js`, health `/health/ready`; signing key as secret file `/etc/secrets/signing-keys.json` |
+| `miqaat-test-console` (web, Node) | Test Console in hosted mode: start `npx ts-node -r tsconfig-paths/register scripts/test-console.ts`, health `/healthz` |
+| `miqaat-auth-db` (Postgres 16) | schema + test members from `npm run seed:dev-db -- --yes` |
+| `miqaat-auth-redis` (Key Value) | Redis, internal only |
+
+* **Database:** `npm run seed:dev-db -- --yes` (with `DB_*` of the target and its `DATA_ENCRYPTION_KEY`) creates
+  the schema from `db/dev-bootstrap-schema.sql` and the test members 10110101..10110110 (`Test@001`..).
+  Nothing is copied from another database; it refuses production and any database with real members.
+* **Core env:** the usual settings with `NODE_ENV=development`, `TRUST_PROXY=1`, `ISSUER=https://<core>`,
+  `SIGNING_KEY_PROVIDER=file`, `EMAIL_TRANSPORT=outbox`, `MFA_STATIC_OTP=123456`, own secrets.
+* **Console env:** the same database / Redis / keys plus `CONSOLE_PUBLIC_URL=https://<console>`,
+  `CONSOLE_HOST=0.0.0.0`, `CONSOLE_PORT=10000`, `CONSOLE_BASIC_AUTH=user:password` (required - the console shows
+  test passwords and registers clients), `CONSOLE_SECRET_RMS_ADMIN` / `_AMS_ADMIN` / `_RMS_MUMIN` (the demo
+  clients' secrets) and `TS_NODE_TRANSPILE_ONLY=true`. In hosted mode the demo apps live under
+  `<console>/app/<key>/` (register their URIs there); Core's back-channel and handoff calls and the OAuth
+  callbacks bypass the console password (they carry their own state / signatures).
+* **Test it:** `CONSOLE_URL=https://<console> CONSOLE_AUTH=user:password ISSUER=https://<core> MFA_STATIC_OTP=123456
+  npm run test:browser` (DB_* of the hosted database for the few database checks), and
+  `npx newman run postman/Miqaat_Core_Auth.postman_collection.json --env-var issuer=https://<core>
+  --env-var console=https://<console> --env-var console_password=…`.
+
 ## Postman collection
 
 `postman/Miqaat_Core_Auth.postman_collection.json` (Postman v2.1) — import it in Postman, or run it:
