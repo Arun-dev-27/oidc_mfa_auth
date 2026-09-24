@@ -73,6 +73,98 @@ const apps: App[] = [
 
 const pending = new Map<string, { app: App; verifier: string; nonce: string; acr: string }>();
 
+// ---- per-browser state -----------------------------------------------------------------------
+/**
+ * The demo apps and the test app play Business Unit backends, and a real BU keeps one session per user.
+ * The console therefore gives each browser its own id cookie (tc_browser) and keeps the demo-app
+ * sessions, errors and event logs, and the test-app sessions, per browser - testers on other browsers or
+ * networks never see or overwrite each other's sign-in. Shared: client secrets, realms and the
+ * "back-channel endpoint down" switch (they describe the app, not a user).
+ * Server-to-server calls from Core (back-channel logout) carry no browser cookie: they find the
+ * browsers that hold the session id in the logout token.
+ */
+const BROWSER_COOKIE = 'tc_browser';
+interface TrySession {
+  claims: Record<string, unknown>;
+  idToken: string;
+  accessToken: string;
+  me: unknown;
+  at: string;
+  via: string;
+}
+interface BrowserState {
+  views: Map<string, App>;
+  trySessions: Map<string, TrySession>;
+  tryEvents: Map<string, { at: string; text: string; ok: boolean }[]>;
+  seen: number;
+}
+const browsers = new Map<string, BrowserState>();
+
+function readCookie(req: IncomingMessage, name: string): string {
+  for (const part of (req.headers.cookie ?? '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return '';
+}
+
+/** The calling browser's state; issues the id cookie on its first visit. */
+function browserOf(req: IncomingMessage, res: ServerResponse): BrowserState {
+  let id = readCookie(req, BROWSER_COOKIE);
+  if (!/^[A-Za-z0-9_-]{24}$/.test(id)) {
+    id = randomBytes(18).toString('base64url');
+    // Hosted (https): SameSite=None so the cross-site POST of a handoff from Core still carries it.
+    const attrs = PUBLIC_URL.startsWith('https:') ? 'Secure; SameSite=None' : 'SameSite=Lax';
+    res.setHeader('set-cookie', `${BROWSER_COOKIE}=${id}; Path=/; HttpOnly; Max-Age=2592000; ${attrs}`);
+  }
+  let state = browsers.get(id);
+  if (!state) {
+    state = { views: new Map(), trySessions: new Map(), tryEvents: new Map(), seen: 0 };
+    browsers.set(id, state);
+  }
+  state.seen = Date.now();
+  return state;
+}
+
+/** This browser's view of a demo app: own session / error / events, everything else from the app. */
+function viewOf(b: BrowserState, app: App): App {
+  let view = b.views.get(app.key);
+  if (!view) {
+    view = Object.create(app) as App;
+    view.session = null;
+    view.lastError = null;
+    view.events = [];
+    b.views.set(app.key, view);
+  }
+  return view;
+}
+
+/** Every browser's view of one demo app (for server-to-server calls). */
+const viewsOf = (key: string): App[] => [...browsers.values()].flatMap((b) => (b.views.has(key) ? [b.views.get(key)!] : []));
+
+/**
+ * Browsers that ended a Core session locally (Logout clicked): the back-channel logout for that sid
+ * arrives after the local session is gone and is still shown to them (10 minutes).
+ */
+const endedLocally = new Map<string, { at: number; views: Set<App>; tries: { b: BrowserState; clientId: string }[] }>();
+function markEnded(sid: unknown, mark: { view?: App; b?: BrowserState; clientId?: string }) {
+  if (typeof sid !== 'string') return;
+  const now = Date.now();
+  for (const [k, v] of endedLocally) if (now - v.at > 600_000) endedLocally.delete(k);
+  const entry = endedLocally.get(sid) ?? { at: now, views: new Set<App>(), tries: [] };
+  if (mark.view) entry.views.add(mark.view);
+  if (mark.b && mark.clientId) entry.tries.push({ b: mark.b, clientId: mark.clientId });
+  endedLocally.set(sid, entry);
+}
+
+/** Core calls these itself (no browser, no cookie). */
+const isServerCall = (path: string) => /\/auth\/core\/logout$/.test(path) || /^\/try\/backchannel\//.test(path);
+
+setInterval(() => {
+  const cutoff = Date.now() - 24 * 3600_000;
+  for (const [id, b] of browsers) if (b.seen < cutoff) browsers.delete(id);
+}, 3600_000).unref();
+
 /** Where a demo app lives: its own localhost port, or a path under the public console URL. */
 const appBase = (app: App) => (HOSTED ? `${PUBLIC_URL}/app/${app.key}` : `http://localhost:${app.port}`);
 
@@ -250,6 +342,7 @@ async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
     pendingLogout.set(state, app);
     const q = new URLSearchParams({ client_id: app.clientId, post_logout_redirect_uri: `${appBase(app)}/logged-out`, state });
     if (app.session) q.set('id_token_hint', app.session.idToken);
+    if (app.session) markEnded(app.session.claims.sid, { view: app });
     event(app, app.session ? 'Logout clicked: local session ended, sent to Core /logout (with id_token_hint)' : 'Logout clicked without a local session: Core asks to confirm');
     app.session = null;
     app.lastError = null;
@@ -269,7 +362,7 @@ async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
   // Back-channel logout endpoint (BU spec §16): server-to-server, no browser cookie needed.
   if (url.pathname === '/auth/core/logout' && req.method === 'POST') {
     if (app.backchannelDown) {
-      event(app, 'Back-channel logout received while "endpoint down" -> answered 503 (Core will retry)', false);
+      for (const v of viewsOf(app.key)) event(v, 'Back-channel logout received while "endpoint down" -> answered 503 (Core will retry)', false);
       res.writeHead(503, { 'content-type': 'application/json' }).end('{"error":"unavailable"}');
       return;
     }
@@ -285,17 +378,25 @@ async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
       if (payload.auth_realm !== app.realm || typeof payload.sid !== 'string' || typeof payload.jti !== 'string') throw new Error('wrong realm / missing sid or jti');
       const replay = seenLogoutJti.has(payload.jti);
       seenLogoutJti.set(payload.jti, Date.now());
-      const hadSession = app.session?.claims.sid === payload.sid;
-      if (hadSession) app.session = null;
-      event(
-        app,
-        replay
-          ? `Back-channel logout replayed (jti ${payload.jti.slice(0, 8)}) - ignored, answered 200`
-          : `Back-channel logout from Core verified (sid ${payload.sid.slice(0, 8)}, ${String(payload.reason)}) -> ${hadSession ? 'local session ended' : 'no local session for that sid'}`,
-      );
+      // Server to server: end the local session in every browser that holds this Core sid.
+      const holders = viewsOf(app.key).filter((v) => v.session?.claims.sid === payload.sid);
+      for (const v of holders) {
+        v.session = null;
+        event(
+          v,
+          replay
+            ? `Back-channel logout replayed (jti ${payload.jti.slice(0, 8)}) - ignored, answered 200`
+            : `Back-channel logout from Core verified (sid ${payload.sid.slice(0, 8)}, ${String(payload.reason)}) -> local session ended`,
+        );
+      }
+      // The browser whose Logout started it: its local session had already ended.
+      for (const v of endedLocally.get(payload.sid)?.views ?? []) {
+        if (v.key !== app.key || holders.includes(v)) continue;
+        event(v, replay ? `Back-channel logout replayed (jti ${payload.jti.slice(0, 8)}) - ignored, answered 200` : `Back-channel logout from Core verified (sid ${payload.sid.slice(0, 8)}, ${String(payload.reason)}) -> local session had already ended`);
+      }
       res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
     } catch (error) {
-      event(app, `Back-channel logout REJECTED: ${error instanceof Error ? error.message : String(error)}`, false);
+      for (const v of viewsOf(app.key)) event(v, `Back-channel logout REJECTED: ${error instanceof Error ? error.message : String(error)}`, false);
       res.writeHead(400, { 'content-type': 'application/json' }).end('{"error":"invalid_logout_token"}');
     }
     return;
@@ -532,13 +633,17 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     return;
   }
   if (req.url === '/healthz') return json(res, 200, { ok: true });
+  const path = (req.url ?? '/').split('?')[0];
+  // Server-to-server calls from Core get no browser state (and no cookie).
+  const B = isServerCall(path.replace(/^\/app\/[a-z-]+/, '')) ? null : browserOf(req, res);
   // Hosted mode: /app/<key>/... is that demo app (its own port locally).
   const appMatch = HOSTED ? /^\/app\/([a-z-]+)(\/.*)?$/.exec(req.url ?? '') : null;
   const hostedApp = appMatch ? apps.find((a) => a.key === appMatch[1]) : undefined;
   if (hostedApp) {
     req.url = appMatch![2] || '/';
-    await appRoute(hostedApp, req, res).catch((e: unknown) => {
-      hostedApp.lastError = e instanceof Error ? e.message : String(e);
+    const view = B ? viewOf(B, hostedApp) : hostedApp;
+    await appRoute(view, req, res).catch((e: unknown) => {
+      view.lastError = e instanceof Error ? e.message : String(e);
       res.writeHead(303, { location: `${PUBLIC_URL}/#${hostedApp.key}` }).end();
     });
     return;
@@ -547,7 +652,7 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
   if (url.pathname === '/api/state') {
     const [o, m, s, a, svc, lo, ck, ho] = await Promise.all([outbox(), members(), coreSessions(), audit(), service(), logoutDeliveries(), browserCookies(req), handoffRequests()]);
     const body = {
-      apps: apps.map(({ key, clientId, label, port, realm, secret, session, lastError, events, backchannelDown }) => ({
+      apps: apps.map((a) => viewOf(B!, a)).map(({ key, clientId, label, port, realm, secret, session, lastError, events, backchannelDown }) => ({
         key,
         base: appBase(apps.find((a) => a.key === key)!),
         clientId,
@@ -573,8 +678,9 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     return;
   }
   if (url.pathname === '/api/clear') {
-    const app = apps.find((a) => a.key === url.searchParams.get('app'));
-    if (app) {
+    const base = apps.find((a) => a.key === url.searchParams.get('app'));
+    if (base) {
+      const app = viewOf(B!, base);
       app.session = null;
       app.lastError = null;
       app.events = [];
@@ -586,7 +692,7 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     const app = apps.find((a) => a.key === url.searchParams.get('app'));
     if (app) {
       app.backchannelDown = url.searchParams.get('down') === '1';
-      event(app, `Back-channel endpoint set ${app.backchannelDown ? 'DOWN (answers 503)' : 'UP'}`, !app.backchannelDown);
+      event(viewOf(B!, app), `Back-channel endpoint set ${app.backchannelDown ? 'DOWN (answers 503)' : 'UP'}`, !app.backchannelDown);
     }
     res.writeHead(204).end();
     return;
@@ -602,8 +708,10 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
         const r = await registerClient(AppDataSource, JSON.parse(await readBody(req)) as RegisterInput);
         if (r.secret) trySecrets.set(r.clientId, r.secret);
         // A new registration starts clean, even if a client with this id existed earlier.
-        trySessions.delete(r.clientId);
-        tryEvents.delete(r.clientId);
+        for (const b of browsers.values()) {
+          b.trySessions.delete(r.clientId);
+          b.tryEvents.delete(r.clientId);
+        }
         return json(res, 201, r);
       }
       const clientId = url.searchParams.get('client_id') ?? '';
@@ -632,7 +740,7 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
   // Plays the new client's backend: sign-in (AAL1 / AAL2), /me, logout + back-channel, handoff in and out.
   if (url.pathname === '/try') {
     const clientId = url.searchParams.get('client_id') ?? '';
-    return tryDashboard(res, clientId);
+    return tryDashboard(B!, res, clientId);
   }
   if (url.pathname === '/try/login') {
     const clientId = url.searchParams.get('client_id') ?? '';
@@ -642,7 +750,7 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     const nonce = randomBytes(12).toString('base64url');
     const acr = url.searchParams.get('acr') ?? '';
     tryPending.set(state, { clientId, verifier, nonce });
-    tryEvent(clientId, `Sign-in started${acr ? ` (acr_values ${acr.replace('urn:miqaat:', '')})` : ''}: browser sent to Core /auth with PKCE S256`);
+    tryEvent(B!, clientId, `Sign-in started${acr ? ` (acr_values ${acr.replace('urn:miqaat:', '')})` : ''}: browser sent to Core /auth with PKCE S256`);
     const q = new URLSearchParams({
       response_type: 'code',
       client_id: clientId,
@@ -662,7 +770,7 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     if (!flow) return tryPage(res, 400, '', '<p class="err">Unknown or used state.</p>');
     tryPending.delete(url.searchParams.get('state') ?? '');
     if (url.searchParams.get('error')) {
-      tryEvent(flow.clientId, `Core answered ${url.searchParams.get('error')}: ${url.searchParams.get('error_description') ?? ''}`, false);
+      tryEvent(B!, flow.clientId, `Core answered ${url.searchParams.get('error')}: ${url.searchParams.get('error_description') ?? ''}`, false);
       return tryRedirect(res, flow.clientId);
     }
     const t = await fetch(`${ISSUER}/token`, {
@@ -672,27 +780,27 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     });
     const body = (await t.json()) as { id_token?: string; access_token?: string; error?: string; error_description?: string };
     if (!body.id_token) {
-      tryEvent(flow.clientId, `Token exchange failed: ${t.status} ${body.error ?? ''} ${body.error_description ?? ''}`, false);
+      tryEvent(B!, flow.clientId, `Token exchange failed: ${t.status} ${body.error ?? ''} ${body.error_description ?? ''}`, false);
       return tryRedirect(res, flow.clientId);
     }
     const { payload, protectedHeader } = await jwtVerify(body.id_token, jwks, { issuer: ISSUER, audience: flow.clientId, algorithms: ['RS256'] });
     if (payload.nonce !== flow.nonce) {
-      tryEvent(flow.clientId, 'nonce mismatch - ID token rejected', false);
+      tryEvent(B!, flow.clientId, 'nonce mismatch - ID token rejected', false);
       return tryRedirect(res, flow.clientId);
     }
     const me = await fetch(`${ISSUER}/me`, { headers: { authorization: `Bearer ${body.access_token}` } }).then((r) => r.json());
-    trySessions.set(flow.clientId, { claims: payload, idToken: body.id_token, accessToken: body.access_token ?? '', me, at: new Date().toISOString(), via: 'sign-in' });
-    tryEvent(flow.clientId, `Signed in: code exchanged at /token with Authorization: Basic, ID token verified (kid ${protectedHeader.kid}), ${String(payload.acr).replace('urn:miqaat:', '')}, amr ${JSON.stringify(payload.amr)}`);
+    B!.trySessions.set(flow.clientId, { claims: payload, idToken: body.id_token, accessToken: body.access_token ?? '', me, at: new Date().toISOString(), via: 'sign-in' });
+    tryEvent(B!, flow.clientId, `Signed in: code exchanged at /token with Authorization: Basic, ID token verified (kid ${protectedHeader.kid}), ${String(payload.acr).replace('urn:miqaat:', '')}, amr ${JSON.stringify(payload.amr)}`);
     return tryRedirect(res, flow.clientId);
   }
   if (url.pathname === '/try/me') {
     const clientId = url.searchParams.get('client_id') ?? '';
-    const s = trySessions.get(clientId);
+    const s = B!.trySessions.get(clientId);
     if (s?.accessToken) {
       const r = await fetch(`${ISSUER}/me`, { headers: { authorization: `Bearer ${s.accessToken}` } });
       s.me = await r.json().catch(() => ({}));
-      tryEvent(clientId, `/me with the access token -> ${r.status}${r.status === 200 ? '' : ' (token no longer valid)'}`, r.status === 200);
-    } else tryEvent(clientId, s ? '/me: this session came from a handoff - no access token (handoff never passes tokens)' : '/me: not signed in', false);
+      tryEvent(B!, clientId, `/me with the access token -> ${r.status}${r.status === 200 ? '' : ' (token no longer valid)'}`, r.status === 200);
+    } else tryEvent(B!, clientId, s ? '/me: this session came from a handoff - no access token (handoff never passes tokens)' : '/me: not signed in', false);
     return tryRedirect(res, clientId);
   }
   if (url.pathname === '/try/logout') {
@@ -700,10 +808,11 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     const state = randomBytes(16).toString('base64url');
     tryLogoutState.set(state, clientId);
     const q = new URLSearchParams({ client_id: clientId, post_logout_redirect_uri: TRY_LOGGED_OUT, state });
-    const s = trySessions.get(clientId);
+    const s = B!.trySessions.get(clientId);
     if (s?.idToken) q.set('id_token_hint', s.idToken);
-    trySessions.delete(clientId);
-    tryEvent(clientId, `Logout: local session ended, browser sent to Core /logout${q.has('id_token_hint') ? ' (with id_token_hint)' : ' (no id_token_hint - Core asks to confirm)'}`);
+    if (s) markEnded(s.claims.sid, { b: B!, clientId });
+    B!.trySessions.delete(clientId);
+    tryEvent(B!, clientId, `Logout: local session ended, browser sent to Core /logout${q.has('id_token_hint') ? ' (with id_token_hint)' : ' (no id_token_hint - Core asks to confirm)'}`);
     res.writeHead(303, { location: `${ISSUER}/logout?${q}` }).end();
     return;
   }
@@ -711,7 +820,7 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     const clientId = tryLogoutState.get(url.searchParams.get('state') ?? '') ?? '';
     tryLogoutState.delete(url.searchParams.get('state') ?? '');
     if (!clientId) return tryPage(res, 400, '', '<p class="err">Back from Core with an unknown state.</p>');
-    tryEvent(clientId, 'Back from Core /logout: the whole realm session is signed out (state checked)');
+    tryEvent(B!, clientId, 'Back from Core /logout: the whole realm session is signed out (state checked)');
     return tryRedirect(res, clientId);
   }
   if (url.pathname.startsWith('/try/backchannel/') && req.method === 'POST') {
@@ -728,12 +837,22 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
       if (payload.auth_realm !== realm || typeof payload.sid !== 'string' || typeof payload.jti !== 'string') throw new Error('wrong realm / missing sid or jti');
       const replay = seenLogoutJti.has(payload.jti);
       seenLogoutJti.set(payload.jti, Date.now());
-      const had = trySessions.get(clientId)?.claims.sid === payload.sid;
-      if (had) trySessions.delete(clientId);
-      tryEvent(clientId, replay ? `Back-channel logout replayed (jti ${payload.jti.slice(0, 8)}) - ignored` : `Back-channel logout from Core verified (sid ${payload.sid.slice(0, 8)}, ${String(payload.reason)}) -> ${had ? 'local session ended' : 'no local session for that sid'}`);
+      const notified = new Set<BrowserState>();
+      for (const b of browsers.values()) {
+        if (b.trySessions.get(clientId)?.claims.sid !== payload.sid) continue;
+        b.trySessions.delete(clientId);
+        notified.add(b);
+        tryEvent(b, clientId, replay ? `Back-channel logout replayed (jti ${payload.jti.slice(0, 8)}) - ignored` : `Back-channel logout from Core verified (sid ${payload.sid.slice(0, 8)}, ${String(payload.reason)}) -> local session ended`);
+      }
+      // The browser whose Logout started it: its local session had already ended.
+      for (const t of endedLocally.get(payload.sid)?.tries ?? []) {
+        if (t.clientId !== clientId || notified.has(t.b)) continue;
+        notified.add(t.b);
+        tryEvent(t.b, clientId, replay ? `Back-channel logout replayed (jti ${payload.jti.slice(0, 8)}) - ignored` : `Back-channel logout from Core verified (sid ${payload.sid.slice(0, 8)}, ${String(payload.reason)}) -> local session had already ended`);
+      }
       return json(res, 200, { ok: true });
     } catch (error) {
-      tryEvent(clientId, `Back-channel logout REJECTED: ${error instanceof Error ? error.message : String(error)}`, false);
+      for (const b of browsers.values()) if (b.trySessions.has(clientId)) tryEvent(b, clientId, `Back-channel logout REJECTED: ${error instanceof Error ? error.message : String(error)}`, false);
       return json(res, 400, { error: 'invalid_logout_token' });
     }
   }
@@ -742,16 +861,16 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     const clientId = url.searchParams.get('client_id') ?? '';
     const target = url.searchParams.get('target') ?? '';
     const path = url.searchParams.get('path') ?? '/dashboard';
-    if (!trySessions.has(clientId)) {
-      tryEvent(clientId, 'Handoff refused: sign in to this app first (a source needs a local session)', false);
+    if (!B!.trySessions.has(clientId)) {
+      tryEvent(B!, clientId, 'Handoff refused: sign in to this app first (a source needs a local session)', false);
       return tryRedirect(res, clientId);
     }
     const r = await handoffRequest(tryBasic(clientId), target, path);
     if (!r.url) {
-      tryEvent(clientId, `Handoff to ${target} ${path} refused by Core: ${r.error}`, false);
+      tryEvent(B!, clientId, `Handoff to ${target} ${path} refused by Core: ${r.error}`, false);
       return tryRedirect(res, clientId);
     }
-    tryEvent(clientId, `Handoff to ${target} ${path}: Core request created, browser sent to Core`);
+    tryEvent(B!, clientId, `Handoff to ${target} ${path}: Core request created, browser sent to Core`);
     res.writeHead(303, { location: r.url }).end();
     return;
   }
@@ -763,10 +882,10 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     if (!source?.secret) return tryRedirect(res, clientId);
     const r = await handoffRequest(`Basic ${Buffer.from(`${source.clientId}:${source.secret}`).toString('base64')}`, clientId, path);
     if (!r.url) {
-      tryEvent(clientId, `Handoff from ${source.clientId} refused by Core: ${r.error}`, false);
+      tryEvent(B!, clientId, `Handoff from ${source.clientId} refused by Core: ${r.error}`, false);
       return tryRedirect(res, clientId);
     }
-    tryEvent(clientId, `${source.label} asked Core to open ${path} in this app - browser sent to Core`);
+    tryEvent(B!, clientId, `${source.label} asked Core to open ${path} in this app - browser sent to Core`);
     res.writeHead(303, { location: r.url }).end();
     return;
   }
@@ -775,19 +894,19 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     const clientId = decodeURIComponent(url.pathname.slice('/try/handoff/'.length));
     const result = await verifyHandoff({ clientId, realm: await clientRealm(clientId) }, new URLSearchParams(await readBody(req)).get('assertion') ?? '');
     if (!result.ok) {
-      tryEvent(clientId, `Handoff REJECTED: ${result.code}`, false);
+      tryEvent(B!, clientId, `Handoff REJECTED: ${result.code}`, false);
       return tryRedirect(res, clientId);
     }
     const c = result.claims;
     if (result.denied) {
-      tryEvent(clientId, `Handoff verified but ${String(c.requested_path)} denied by this app's authorization`, false);
+      tryEvent(B!, clientId, `Handoff verified but ${String(c.requested_path)} denied by this app's authorization`, false);
       return tryRedirect(res, clientId);
     }
     // Same Core session as the local one: keep its tokens (logout still sends id_token_hint).
-    const prev = trySessions.get(clientId);
+    const prev = B!.trySessions.get(clientId);
     const same = prev !== undefined && prev.claims.sid === c.sid;
-    trySessions.set(clientId, { claims: c, idToken: same ? prev.idToken : '', accessToken: same ? prev.accessToken : '', me: same ? prev.me : null, at: new Date().toISOString(), via: `handoff from ${String(c.source_client_id)}` });
-    tryEvent(clientId, `Handoff from ${String(c.source_client_id)} verified (JWKS, aud, one-time jti) -> local session for ITS ${String(c.sub)} at ${String(c.requested_path)}, no password`);
+    B!.trySessions.set(clientId, { claims: c, idToken: same ? prev.idToken : '', accessToken: same ? prev.accessToken : '', me: same ? prev.me : null, at: new Date().toISOString(), via: `handoff from ${String(c.source_client_id)}` });
+    tryEvent(B!, clientId, `Handoff from ${String(c.source_client_id)} verified (JWKS, aud, one-time jti) -> local session for ITS ${String(c.sub)} at ${String(c.requested_path)}, no password`);
     return tryRedirect(res, clientId);
   }
 
@@ -804,13 +923,10 @@ const TRY_LOGGED_OUT = `${PUBLIC_URL}/try/logged-out`;
 const trySecrets = new Map<string, string>();
 const tryPending = new Map<string, { clientId: string; verifier: string; nonce: string }>();
 const tryLogoutState = new Map<string, string>();
-const trySessions = new Map<string, { claims: Record<string, unknown>; idToken: string; accessToken: string; me: unknown; at: string; via: string }>();
-const tryEvents = new Map<string, { at: string; text: string; ok: boolean }[]>();
-
-function tryEvent(clientId: string, text: string, ok = true) {
-  const list = tryEvents.get(clientId) ?? [];
+function tryEvent(b: BrowserState, clientId: string, text: string, ok = true) {
+  const list = b.tryEvents.get(clientId) ?? [];
   list.unshift({ at: new Date().toISOString(), text, ok });
-  tryEvents.set(clientId, list.slice(0, 12));
+  b.tryEvents.set(clientId, list.slice(0, 12));
 }
 
 const tryBasic = (clientId: string) => `Basic ${Buffer.from(`${encodeURIComponent(clientId)}:${encodeURIComponent(trySecrets.get(clientId) ?? '')}`).toString('base64')}`;
@@ -852,10 +968,10 @@ function sameOriginJson(req: IncomingMessage): boolean {
   );
 }
 
-async function tryDashboard(res: ServerResponse, clientId: string) {
+async function tryDashboard(b: BrowserState, res: ServerResponse, clientId: string) {
   const client = (await listClients(AppDataSource)).find((c) => c.clientId === clientId);
   if (!client) return tryPage(res, 404, clientId, '<p class="err">Unknown client.</p>');
-  const s = trySessions.get(clientId);
+  const s = b.trySessions.get(clientId);
   const id = encodeURIComponent(clientId);
   const hasSecret = trySecrets.has(clientId);
   const notes: string[] = [];
@@ -879,7 +995,7 @@ async function tryDashboard(res: ServerResponse, clientId: string) {
         .map((a) => `<a class="btn light" href="/try/handoff-in?client_id=${id}&source=${encodeURIComponent(a.clientId)}&path=%2Fdashboard">${esc(a.label)}</a>`)
         .join('')}</div>`
     : '<p class="muted">Handoff in: not enabled for this client.</p>';
-  const events = (tryEvents.get(clientId) ?? []).map((e) => `<li class="${e.ok ? '' : 'no'}">${new Date(e.at).toLocaleTimeString()} · ${esc(e.text)}</li>`).join('');
+  const events = (b.tryEvents.get(clientId) ?? []).map((e) => `<li class="${e.ok ? '' : 'no'}">${new Date(e.at).toLocaleTimeString()} · ${esc(e.text)}</li>`).join('');
   return tryPage(
     res,
     200,
@@ -1168,8 +1284,9 @@ async function main() {
   for (const app of HOSTED ? [] : apps) {
     createServer(
       wrap(async (req, res) => {
-        await appRoute(app, req, res).catch((e: unknown) => {
-          app.lastError = e instanceof Error ? e.message : String(e);
+        const view = isServerCall((req.url ?? '/').split('?')[0]) ? app : viewOf(browserOf(req, res), app);
+        await appRoute(view, req, res).catch((e: unknown) => {
+          view.lastError = e instanceof Error ? e.message : String(e);
           res.writeHead(303, { location: `${PUBLIC_URL}/#${app.key}` }).end();
         });
       }),

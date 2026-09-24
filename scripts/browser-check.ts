@@ -37,9 +37,14 @@ const check = (name: string, ok: boolean, detail = '') => {
   console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${!ok && detail ? `  -> ${detail}` : ''}`);
 };
 
-async function state() {
-  return (await (await cfetch(`${CONSOLE}/api/state`)).json()) as {
-    apps: { key: string; session: { claims: Record<string, unknown> } | null; lastError: string | null }[];
+/**
+ * Console state. Demo-app sessions are per browser (console cookie), so pass the Playwright page whose
+ * browser is meant; without a page only the shared panels (outbox, members, logout deliveries) are valid.
+ */
+async function state(p?: Page) {
+  const body = p ? await (await p.request.get(`${CONSOLE}/api/state`)).json() : await (await cfetch(`${CONSOLE}/api/state`)).json();
+  return body as {
+    apps: { key: string; session: { claims: Record<string, unknown> } | null; lastError: string | null; events: { text: string }[] }[];
     outbox: { code: string; at: string }[];
     members: { itsId: string; password: string }[];
   };
@@ -83,7 +88,7 @@ async function signIn(page: Page, appKey: string, button: string, itsId: string,
     }
   }
   await page.waitForURL((u) => u.toString().startsWith(CONSOLE), { timeout: 15_000 });
-  const app = (await state()).apps.find((a) => a.key === appKey)!;
+  const app = (await state(page)).apps.find((a) => a.key === appKey)!;
   return { seen, claims: app.session?.claims ?? null, error: app.lastError };
 }
 
@@ -158,7 +163,7 @@ async function main() {
     check('Wrong password -> "Incorrect ITS ID or password." (no CSRF / expired-form error)', wrong === 'Incorrect ITS ID or password.', wrong);
     await fresh.fill('#password', pw('10110101'));
     await Promise.all([fresh.waitForURL((u) => u.toString().startsWith(CONSOLE), { timeout: 15_000 }), fresh.click('button[data-submit]')]);
-    const aal1 = (await state()).apps.find((a) => a.key === 'rms-admin')!.session?.claims;
+    const aal1 = (await state(fresh)).apps.find((a) => a.key === 'rms-admin')!.session?.claims;
     check('Retry with the right password on the same form -> signed in (AAL1)', aal1?.acr === 'urn:miqaat:aal:1');
 
     const mfaPage = await (await browser.newContext(CTX)).newPage();
@@ -175,7 +180,7 @@ async function main() {
     check('"Use SMS instead" switches the page to SMS', (await mfaPage.locator('.subtitle').innerText()).includes('SMS'));
     await Promise.all([mfaPage.waitForLoadState('load'), mfaPage.getByRole('button', { name: 'Cancel sign-in' }).click()]);
     await mfaPage.waitForURL((u) => u.toString().startsWith(CONSOLE));
-    const cancelled = (await state()).apps.find((a) => a.key === 'rms-admin')!.lastError ?? '';
+    const cancelled = (await state(mfaPage)).apps.find((a) => a.key === 'rms-admin')!.lastError ?? '';
     check('Cancel -> app receives access_denied', cancelled.startsWith('access_denied'), cancelled);
 
     // ---- logout ------------------------------------------------------------------------------
@@ -191,11 +196,11 @@ async function main() {
     await Promise.all([lb.waitForURL((u) => u.toString().startsWith(CONSOLE), { timeout: 15_000 }), lb.locator('#rms-admin').getByRole('link', { name: /^Logout/ }).click()]);
     check('Logout on RMS Admin returns straight to the console (id_token_hint -> no confirmation)', lb.url().startsWith(CONSOLE));
     const afterLogout = await waitFor(async () => {
-      const s = await state();
+      const s = await state(lb);
       const ams = s.apps.find((a) => a.key === 'ams-admin')!;
       return ams.session ? null : s;
     });
-    const apps = afterLogout?.apps ?? (await state()).apps;
+    const apps = afterLogout?.apps ?? (await state(lb)).apps;
     check('RMS Admin signed out (local session ended before Core)', !apps.find((a) => a.key === 'rms-admin')!.session);
     check('AMS Admin signed out by Core back-channel logout (verified JWS)', !apps.find((a) => a.key === 'ams-admin')!.session);
     check('RMS Mumin still signed in (MUMIN realm untouched)', Boolean(apps.find((a) => a.key === 'rms-mumin')!.session));
@@ -214,7 +219,7 @@ async function main() {
     check('RMS Mumin still signs in silently', mumin.seen.length === 0, mumin.seen.join(','));
 
     // Logout with no local session -> Core asks to confirm.
-    await cfetch(`${CONSOLE}/api/clear?app=ams-admin`);
+    await lb.request.get(`${CONSOLE}/api/clear?app=ams-admin`);
     await lb.goto(`${CONSOLE}/`);
     await lb.locator('#ams-admin').getByRole('link', { name: /^Logout/ }).click();
     await lb.waitForSelector('text=Sign out?');
@@ -242,7 +247,7 @@ async function main() {
       const d = l.find((x) => x.client_id === 'ams-admin-dev');
       return d && d.status === 'SUCCEEDED' ? d : null;
     }, 20_000);
-    check('Endpoint back up -> next retry SUCCEEDED and AMS signed out', Boolean(recovered) && !(await state()).apps.find((a) => a.key === 'ams-admin')!.session, recovered ? `attempts ${recovered.attempt_count}` : 'no success');
+    check('Endpoint back up -> next retry SUCCEEDED and AMS signed out', Boolean(recovered) && !(await state(rb)).apps.find((a) => a.key === 'ams-admin')!.session, recovered ? `attempts ${recovered.attempt_count}` : 'no success');
 
     // ---- trusted handoff ---------------------------------------------------------------------
     console.log('\n=== Real browser: trusted handoff (RMS Admin -> AMS Admin)');
@@ -264,7 +269,7 @@ async function main() {
     await handoff('ams-admin', '/events/123');
     check('Handoff lands on AMS Admin /events/123 (no login page, auto-POST)', hb.url() === `${AMS}/events/123`, hb.url());
     check('Landing page says it arrived by trusted handoff', (await hb.locator('main').innerText()).includes('trusted handoff'));
-    const ams = (await state()).apps.find((a) => a.key === 'ams-admin')!.session?.claims;
+    const ams = (await state(hb)).apps.find((a) => a.key === 'ams-admin')!.session?.claims;
     check('AMS Admin local session: same ITS ID and Core sid as RMS Admin', ams?.sub === '10110101' && ams?.sid === src.claims?.sid && ams?.source_client_id === 'rms-admin-dev');
     const replay = await fetch(`${AMS}/auth/core/handoff`, { method: 'POST', body: new URLSearchParams({ assertion }), redirect: 'manual' });
     check('Replaying the captured assertion -> 400 HANDOFF_REPLAYED', replay.status === 400 && (await replay.text()).includes('HANDOFF_REPLAYED'));
@@ -275,7 +280,7 @@ async function main() {
     await handoff('ams-admin', '/admin/users');
     check('Handoff to /admin/users: target authorization denies it (403 page)', (await hb.locator('h2').innerText()).includes('Access denied'));
     await handoff('rms-mumin', '/events/123');
-    const events = ((await (await cfetch(`${CONSOLE}/api/state`)).json()) as { apps: { key: string; events: { text: string }[] }[] }).apps.find((a) => a.key === 'rms-admin')!.events;
+    const events = (await state(hb)).apps.find((a) => a.key === 'rms-admin')!.events;
     check('ADMIN -> MUMIN handoff refused by Core (REALM_MISMATCH), browser back on console', hb.url().startsWith(CONSOLE) && events.some((e) => e.text.includes('REALM_MISMATCH')), events[0]?.text);
 
     // ---- a client registered in the UI, tested end to end through the console test app ----------
@@ -393,7 +398,7 @@ async function main() {
       return (await main()).includes('Back-channel logout from Core verified') ? true : null;
     }, 15_000);
     check('New client receives and verifies its back-channel logout (signed miqaat-logout+jwt)', Boolean(bcOk));
-    const amsGone = await waitFor(async () => ((await state()).apps.find((a) => a.key === 'ams-admin')!.session ? null : true), 10_000);
+    const amsGone = await waitFor(async () => ((await state(cp)).apps.find((a) => a.key === 'ams-admin')!.session ? null : true), 10_000);
     check('AMS Admin signed out too (realm-wide logout, back-channel)', Boolean(amsGone));
     const uiDeliveries = (await dbQuery(
       `SELECT d.client_id, d.status FROM logout_deliveries d JOIN logout_jobs j ON j.id = d.job_id WHERE j.initiated_by_client = $1 ORDER BY j.created_at DESC LIMIT 5`,
@@ -446,6 +451,24 @@ async function main() {
     check('Registration API refuses requests from another origin (403)', crossSite.status === 403);
     await deleteUiClient();
 
+    // ---- two testers, two browsers: the console keeps each browser's sessions apart -------------
+    console.log('\n=== Real browser: two browsers at the same time (per-browser console sessions)');
+    const pa = await (await browser.newContext(CTX)).newPage();
+    const pb = await (await browser.newContext(CTX)).newPage();
+    const rmsOf = async (p: Page) => (await state(p)).apps.find((a) => a.key === 'rms-admin')!.session?.claims ?? null;
+    await signIn(pa, 'rms-admin', 'Sign in (AAL1)', '10110101', pw('10110101'));
+    check('Browser A signed in to RMS Admin as 10110101; browser B sees RMS Admin not signed in', (await rmsOf(pa))?.sub === '10110101' && (await rmsOf(pb)) === null);
+    await signIn(pb, 'rms-admin', 'Sign in (AAL1)', '10110110', pw('10110110'));
+    const aSeen = await rmsOf(pa);
+    const bSeen = await rmsOf(pb);
+    check('Browser B signs in as 10110110: B sees 10110110, A still sees 10110101 (no overwrite)', aSeen?.sub === '10110101' && bSeen?.sub === '10110110' && aSeen?.sid !== bSeen?.sid);
+    await pa.goto(`${CONSOLE}/`);
+    await Promise.all([pa.waitForURL((u) => u.toString().startsWith(CONSOLE), { timeout: 15_000 }), pa.locator('#rms-admin').getByRole('link', { name: /^Logout/ }).click()]);
+    await new Promise((r) => setTimeout(r, 1500)); // let Core's back-channel logout arrive
+    check('Browser A logs out: A signed out, B still signed in as 10110110', (await rmsOf(pa)) === null && (await rmsOf(pb))?.sub === '10110110');
+    await pa.context().close();
+    await pb.context().close();
+
     // ---- testing static OTP (only when the running service has MFA_STATIC_OTP) ---------------
     const fixed = process.env.MFA_STATIC_OTP?.trim();
     if (fixed) {
@@ -465,7 +488,7 @@ async function main() {
         await Promise.all([sp.waitForSelector('#code', { timeout: 15_000 }), sp.click('button[data-submit]')]);
         await sp.fill('#code', fixed);
         await Promise.all([sp.waitForURL((u) => u.toString().startsWith(CONSOLE), { timeout: 15_000 }), sp.click('button[data-submit]')]);
-        const claims = (await state()).apps.find((a) => a.key === 'rms-admin')!.session?.claims;
+        const claims = (await state(sp)).apps.find((a) => a.key === 'rms-admin')!.session?.claims;
         check(`${label} (${itsId}): typing ${fixed} completes MFA -> aal:2`, claims?.sub === itsId && claims?.acr === 'urn:miqaat:aal:2', JSON.stringify(claims?.acr));
         await sp.context().close();
       }
