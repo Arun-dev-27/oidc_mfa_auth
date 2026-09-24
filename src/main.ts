@@ -46,6 +46,11 @@ async function bootstrap() {
     referrerPolicy: { policy: 'same-origin' },
     crossOriginEmbedderPolicy: false,
   });
+  // Sign-in, MFA, logout and API responses must never be indexed by search engines.
+  fastify.addHook('onSend', async (_req, reply, payload) => {
+    reply.header('x-robots-tag', 'noindex, nofollow');
+    return payload;
+  });
   await app.register(fastifyStatic, { root: resolve(process.cwd(), 'public'), prefix: '/assets/', maxAge: '1h' });
 
   await mountOidcProvider(fastify, app.get<OidcProvider>(OIDC_PROVIDER));

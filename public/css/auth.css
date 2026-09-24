@@ -116,6 +116,20 @@ body {
   margin: auto 0;
 }
 
+/* ENVIRONMENT_BANNER: marks non-production deployments on every page. */
+.env-banner {
+  width: 100%;
+  max-width: 420px;
+  margin-bottom: 20px;
+  padding: 10px 14px;
+  border: 1px solid #f0c36d;
+  border-radius: 10px;
+  background: #fff7e0;
+  color: #6b4a00;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .panel-footer {
   margin-top: 32px;
   font-size: 12px;

@@ -8,7 +8,7 @@ import { HandoffController } from '../handoff/handoff.controller';
 import { HandoffService } from '../handoff/handoff.service';
 import { KeysModule } from '../keys/keys.module';
 import { LogoutDeliveryWorker } from '../logout/logout-delivery.worker';
-import { LogoutController } from '../logout/logout.controller';
+import { LegacyEndSessionController, LogoutController } from '../logout/logout.controller';
 import { LogoutService } from '../logout/logout.service';
 import { SigningKeyService } from '../keys/signing-key.service';
 import { MfaModule } from '../mfa/mfa.module';
@@ -26,7 +26,7 @@ import { createProvider } from './provider.factory';
 
 @Module({
   imports: [KeysModule, IdentityModule, SessionsModule, MfaModule, SecurityModule, ViewsModule],
-  controllers: [InteractionController, LogoutController, HandoffController],
+  controllers: [InteractionController, LogoutController, LegacyEndSessionController, HandoffController],
   providers: [
     ClientRegistryService,
     {

@@ -464,6 +464,16 @@ async function main() {
       check('client auth: client_secret_basic only (standard), never "none"', same(methods, ['client_secret_basic']), JSON.stringify(methods));
       for (const c of ['sub', 'auth_realm', 'sid', 'acr', 'amr']) check(`claim "${c}" supported`, (d.claims_supported as string[]).includes(c));
     });
+    await scenario('search engines and legacy logout paths', async () => {
+      for (const p of ['/.well-known/openid-configuration', '/logout?client_id=e2e-rms-admin', '/health/live']) {
+        const r = await fetch(`${ISSUER}${p}`, { redirect: 'manual' });
+        check(`X-Robots-Tag noindex on ${p.split('?')[0]}`, r.headers.get('x-robots-tag') === 'noindex, nofollow');
+      }
+      const legacy = await fetch(`${ISSUER}/session/end/confirm?client_id=e2e-rms-admin&state=s1&other=x`, { redirect: 'manual' });
+      check('/session/end/confirm -> 303 /logout with the logout parameters only', legacy.status === 303 && legacy.headers.get('location') === '/logout?client_id=e2e-rms-admin&state=s1', legacy.headers.get('location') ?? '');
+      const bare = await fetch(`${ISSUER}/session/end`, { redirect: 'manual' });
+      check('/session/end -> 303 /logout', bare.status === 303 && bare.headers.get('location') === '/logout');
+    });
     await scenario('jwks', async () => {
       const jwks = await fetchJwks();
       check('JWKS has at least one RS256 signing key', jwks.keys.length > 0 && jwks.keys.every((k) => k.alg === 'RS256' && k.use === 'sig' && typeof k.kid === 'string'));

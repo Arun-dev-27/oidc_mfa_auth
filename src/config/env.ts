@@ -172,6 +172,16 @@ export const envSchema = z
 
     // --- Branding on the SSR pages ----------------------------------------------------------
     BRAND_TAGLINE: z.string().default('Your Miqaat, in one place'),
+    /**
+     * Shown at the top of every Core page when set, e.g. on a hosted test environment:
+     * "Test environment - test accounts only. Never enter a real ITS password." Empty = no banner.
+     */
+    ENVIRONMENT_BANNER: z.string().default(''),
+    /** Google Search Console ownership token (meta google-site-verification), e.g. to request a Safe Browsing review. */
+    GOOGLE_SITE_VERIFICATION: z
+      .string()
+      .default('')
+      .refine((v) => v === '' || /^[A-Za-z0-9_-]{10,100}$/.test(v), 'GOOGLE_SITE_VERIFICATION: the token only (letters, digits, - and _)'),
     /** Optional link for "Forgot password?" (hidden when empty). */
     FORGOT_PASSWORD_URL: z.union([z.string().url(), z.literal('')]).default(''),
   })

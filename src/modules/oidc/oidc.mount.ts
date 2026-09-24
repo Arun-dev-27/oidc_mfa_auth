@@ -24,6 +24,8 @@ export async function mountOidcProvider(fastify: FastifyInstance, provider: Oidc
           for (const [name, value] of Object.entries(reply.getHeaders())) {
             if (value !== undefined && !reply.raw.headersSent) reply.raw.setHeader(name, value as string);
           }
+          // Hijacked replies skip the onSend hook in main.ts: never index the provider endpoints either.
+          if (!reply.raw.headersSent) reply.raw.setHeader('x-robots-tag', 'noindex, nofollow');
           await callback(req.raw, reply.raw);
         },
       });

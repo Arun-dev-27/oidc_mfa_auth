@@ -68,7 +68,9 @@ export class AuthPagesService {
       csrf,
       method: option.method,
       isTotp: option.method === 'TOTP',
-      isOtp: option.method !== 'TOTP',
+      // MFA_STATIC_OTP testing step for a member without any method (nothing is sent).
+      isTestCode: option.method !== 'TOTP' && option.destination === null,
+      isOtp: option.method !== 'TOTP' && option.destination !== null,
       destination: option.masked,
       channelLabel: option.label,
       challengeId: data.challengeId ?? '',

@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#15402f" />
     <meta name="robots" content="noindex, nofollow" />
+    {{#googleSiteVerification}}<meta name="google-site-verification" content="{{googleSiteVerification}}" />{{/googleSiteVerification}}
     <title>{{title}} · Miqaat</title>
     <link rel="icon" type="image/svg+xml" href="/assets/img/favicon.svg" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -29,6 +30,7 @@
       </section>
 
       <section class="panel">
+        {{#banner}}<div class="env-banner" role="note"><strong>Test environment</strong> · {{banner}}</div>{{/banner}}
         <div class="card">
           {{{content}}}
         </div>

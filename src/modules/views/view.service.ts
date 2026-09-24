@@ -28,7 +28,14 @@ export class ViewService {
   constructor(private readonly config: AppConfig) {}
 
   render(name: string, data: ViewData): string {
-    const base: ViewData = { tagline: this.config.env.BRAND_TAGLINE, year: new Date().getFullYear(), ...data };
+    const env = this.config.env;
+    const base: ViewData = {
+      tagline: env.BRAND_TAGLINE,
+      year: new Date().getFullYear(),
+      banner: env.ENVIRONMENT_BANNER || undefined,
+      googleSiteVerification: env.GOOGLE_SITE_VERIFICATION || undefined,
+      ...data,
+    };
     const content = this.fill(this.template(name), base);
     return this.fill(this.template('layout'), { ...base, content });
   }
