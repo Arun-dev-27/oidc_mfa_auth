@@ -99,7 +99,8 @@ export function createProvider(d: ProviderDeps): Provider {
     discovery: { end_session_endpoint: `${env.ISSUER}/logout` },
     responseTypes: ['code'],
     pkce: { required: () => true },
-    clientAuthMethods: ['private_key_jwt', 'client_secret_basic', 'client_secret_post'],
+    // Standard: client_secret_basic. Others only when listed in CLIENT_AUTH_METHODS.
+    clientAuthMethods: [...env.CLIENT_AUTH_METHODS],
     enabledJWA: {
       idTokenSigningAlgValues: ['RS256'],
       clientAuthSigningAlgValues: ['RS256', 'PS256', 'ES256'],

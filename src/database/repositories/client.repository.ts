@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
 import type { DataSource, Repository } from 'typeorm';
-import { AuthClient, AuthClientCallback, type AuthRealm, type CallbackUriType, type TokenEndpointAuthMethod } from '../entities';
+import { AuthClient, AuthClientCallback, type AuthRealm, type CallbackUriType, type ClientStatus, type TokenEndpointAuthMethod } from '../entities';
 
 export interface NewClient {
   clientId: string;
@@ -47,6 +47,21 @@ export class ClientRepository {
       const exists = await repo.exists({ where: { clientRef: client.id, uriType, uri } });
       if (!exists) await repo.save(repo.create({ clientRef: client.id, uriType, uri, isPrimary: false }));
     });
+  }
+
+  /**
+   * Replaces the client secret (stored encrypted) and moves the client to a secret method. The old
+   * secret stops working at once; private_key_jwt keys are cleared.
+   */
+  async setSecret(clientId: string, clientSecretEnc: string, method: 'client_secret_basic' | 'client_secret_post'): Promise<void> {
+    const result = await this.clients.update({ clientId }, { clientSecretEnc, tokenEndpointAuthMethod: method, clientJwksUri: null, clientJwks: null });
+    if (!result.affected) throw new Error(`unknown client ${clientId}`);
+  }
+
+  /** ACTIVE clients can sign in; SUSPENDED / RETIRED are refused by Core at once (no cache). */
+  async setStatus(clientId: string, status: ClientStatus): Promise<void> {
+    const result = await this.clients.update({ clientId }, { status });
+    if (!result.affected) throw new Error(`unknown client ${clientId}`);
   }
 
   /** Removes clients by exact id (test tooling only; callbacks cascade). */

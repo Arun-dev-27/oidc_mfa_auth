@@ -17,10 +17,11 @@ export interface AuthenticatedClient {
 /**
  * Authenticates a registered client calling a Core API directly (e.g. the handoff API, Handoff spec §5),
  * with the same methods as the token endpoint:
- *   private_key_jwt       client_assertion signed with the client's registered key (preferred)
- *   client_secret_basic   Authorization: Basic
- *   client_secret_post    client_id + client_secret in the body
- * The client may only use the method it is registered for. The client_id is taken from the verified
+ *   client_secret_basic   Authorization: Basic base64(client_id:client_secret)   (standard)
+ *   private_key_jwt       client_assertion signed with the client's registered key   (if enabled)
+ *   client_secret_post    client_id + client_secret in the body                      (if enabled)
+ * Only methods listed in CLIENT_AUTH_METHODS are accepted, and a client may only use the method it
+ * is registered for. The client_id is taken from the verified
  * credentials, never from an unauthenticated body field.
  */
 @Injectable()
@@ -35,12 +36,13 @@ export class ClientAuthService {
 
   /** Returns the authenticated client, or null (the caller answers 401). */
   async authenticate(req: FastifyRequest, body: Record<string, unknown>, audiences: string[]): Promise<AuthenticatedClient | null> {
+    const allowed = this.config.env.CLIENT_AUTH_METHODS;
     if (body.client_assertion_type === JWT_BEARER && typeof body.client_assertion === 'string') {
-      return this.privateKeyJwt(body.client_assertion, audiences);
+      return allowed.includes('private_key_jwt') ? this.privateKeyJwt(body.client_assertion, audiences) : null;
     }
     const basic = parseBasic(req.headers.authorization);
-    if (basic) return this.secret(basic.id, basic.secret, 'client_secret_basic');
-    if (typeof body.client_id === 'string' && typeof body.client_secret === 'string') {
+    if (basic) return allowed.includes('client_secret_basic') ? this.secret(basic.id, basic.secret, 'client_secret_basic') : null;
+    if (allowed.includes('client_secret_post') && typeof body.client_id === 'string' && typeof body.client_secret === 'string') {
       return this.secret(body.client_id, body.client_secret, 'client_secret_post');
     }
     return null;

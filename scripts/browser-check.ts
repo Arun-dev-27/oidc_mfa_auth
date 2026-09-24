@@ -10,6 +10,7 @@
  * form POST carries, cookie SameSite handling, the client-side script).
  */
 import { chromium, type Page } from 'playwright-core';
+import { Pool } from 'pg';
 import { loadDotEnv } from '../src/config/env';
 
 loadDotEnv();
@@ -80,6 +81,27 @@ async function waitFor<T>(fn: () => Promise<T | null>, timeoutMs = 10_000): Prom
     await new Promise((r) => setTimeout(r, 300));
   }
   return null;
+}
+
+/** The registration UI test owns exactly this client row (callbacks and handoff paths cascade). */
+const UI_CLIENT = 'console-ui-check';
+async function dbQuery(sql: string, params: unknown[]): Promise<unknown[]> {
+  const pool = new Pool({
+    host: process.env.DB_HOST,
+    port: Number(process.env.DB_PORT),
+    database: process.env.DB_NAME,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    options: `-c search_path=${process.env.DB_SCHEMA}`,
+  });
+  try {
+    return (await pool.query(sql, params)).rows;
+  } finally {
+    await pool.end();
+  }
+}
+async function deleteUiClient() {
+  await dbQuery('DELETE FROM auth_clients WHERE client_id = $1', [UI_CLIENT]);
 }
 
 async function alertText(page: Page) {
@@ -239,6 +261,171 @@ async function main() {
     await handoff('rms-mumin', '/events/123');
     const events = ((await (await fetch(`${CONSOLE}/api/state`)).json()) as { apps: { key: string; events: { text: string }[] }[] }).apps.find((a) => a.key === 'rms-admin')!.events;
     check('ADMIN -> MUMIN handoff refused by Core (REALM_MISMATCH), browser back on console', hb.url().startsWith(CONSOLE) && events.some((e) => e.text.includes('REALM_MISMATCH')), events[0]?.text);
+
+    // ---- a client registered in the UI, tested end to end through the console test app ----------
+    console.log('\n=== Real browser: register a new client in the UI and test everything with it');
+    await deleteUiClient();
+    for (const key of ['rms-admin', 'ams-admin', 'rms-mumin']) await fetch(`${CONSOLE}/api/clear?app=${key}`);
+    const cp = await (await browser.newContext()).newPage();
+    cp.on('dialog', (d) => void d.accept());
+    const USER = '10110105';
+    const TEST_APP = `${CONSOLE}/try?client_id=${UI_CLIENT}`;
+    const main = async () => (await cp.locator('main').innerText()).replace(/\s+/g, ' ');
+    /** Completes whatever Core shows (login / MFA) until the browser leaves Core; returns the pages seen. */
+    const throughCore = async () => {
+      const seen: string[] = [];
+      let since = Date.now() - 2000;
+      for (let i = 0; i < 4; i++) {
+        await cp.waitForLoadState('load');
+        if (!cp.url().startsWith('http://localhost:4000')) break;
+        if (await cp.locator('#its_id').count()) {
+          seen.push('login');
+          await cp.fill('#its_id', USER);
+          await cp.fill('#password', pw(USER));
+          since = Date.now();
+          await Promise.all([cp.waitForLoadState('load'), cp.click('button[data-submit]')]);
+        } else if (await cp.locator('#code').count()) {
+          seen.push('mfa');
+          await cp.fill('#code', await latestCodeAfter(since));
+          await Promise.all([cp.waitForURL((u) => !u.toString().includes('/mfa'), { timeout: 15_000 }).catch(() => undefined), cp.click('button[data-submit]')]);
+        } else break;
+      }
+      await cp.waitForLoadState('load');
+      return seen;
+    };
+    const click = async (name: string) => {
+      await Promise.all([cp.waitForLoadState('load'), cp.getByRole('link', { name, exact: true }).first().click()]);
+    };
+
+    // 1. Register through the form.
+    await cp.goto(`${CONSOLE}/#clients`);
+    await cp.waitForFunction(`document.querySelector('#regform textarea[name="redirectUris"]').value.includes('/try/callback')`);
+    const form = cp.locator('#regform');
+    await form.locator('input[name="clientId"]').fill(UI_CLIENT);
+    await form.locator('input[name="name"]').fill('Console UI check');
+    await form.locator('select[name="realm"]').selectOption('ADMIN');
+    await form.locator('input[name="businessUnit"]').fill('QA');
+    await form.getByRole('button', { name: 'Use console test URLs' }).click();
+    const bcUri = await form.locator('input[name="backchannelLogoutUri"]').inputValue();
+    const hoUri = await form.locator('input[name="handoffCallbackUri"]').inputValue();
+    check('"Use console test URLs" fills redirect, post-logout, back-channel and handoff URIs for this client', bcUri.endsWith(`/try/backchannel/${UI_CLIENT}`) && hoUri.endsWith(`/try/handoff/${UI_CLIENT}`) && (await form.locator('input[name="inbound"]').isChecked()));
+    await form.getByRole('button', { name: 'Register client' }).click();
+    await cp.waitForSelector('#newsecret');
+    const secret1 = (await cp.locator('#newsecret').innerText()).trim();
+    const result = await cp.locator('#regresult').innerText();
+    check('Register -> 64-hex secret shown once + the Authorization: Basic header', /^[0-9a-f]{64}$/.test(secret1) && result.includes('Authorization: Basic '));
+    await cp.waitForSelector(`#clientrows tr:has-text("${UI_CLIENT}")`);
+    const row = (await cp.locator(`#clientrows tr:has-text("${UI_CLIENT}")`).innerText()).replace(/\s+/g, ' ');
+    check('Listed: ADMIN, client_secret_basic, ACTIVE, handoff out+in, usable', row.includes('ADMIN') && row.includes('client_secret_basic') && row.includes('ACTIVE') && row.includes('out in') && /\byes\b/.test(row), row);
+    const [dbRow] = (await dbQuery('SELECT client_secret_enc, token_endpoint_auth_method, status FROM auth_clients WHERE client_id = $1', [UI_CLIENT])) as { client_secret_enc: string; token_endpoint_auth_method: string; status: string }[];
+    check('Stored in auth_clients: encrypted secret (not the plain one), client_secret_basic, ACTIVE', Boolean(dbRow) && !dbRow.client_secret_enc.includes(secret1) && dbRow.token_endpoint_auth_method === 'client_secret_basic' && dbRow.status === 'ACTIVE');
+
+    // 2. Open the test app and sign in at AAL1.
+    await Promise.all([cp.waitForLoadState('load'), cp.locator('#regresult').getByRole('link', { name: 'Open test app' }).click()]);
+    check('Test app opens: not signed in yet', (await main()).includes('Not signed in'));
+    await click('Sign in (AAL1)');
+    const s1 = await throughCore();
+    let m = await main();
+    check('Sign in (AAL1): Core login page -> back signed in, aal:1, amr ["pwd"]', s1.join(',') === 'login' && m.includes(`Signed in as ITS ${USER}`) && m.includes('aal:1') && m.includes('["pwd"]'), `${s1.join(',')} | ${m.slice(0, 200)}`);
+    check('Code exchanged at /token with Authorization: Basic and ID token verified (aud = new client)', m.includes('Authorization: Basic') && m.includes(`"aud": "${UI_CLIENT}"`));
+    const sid1 = /sid ([0-9a-f]{8})/.exec(m)?.[1];
+
+    // 3. /me.
+    await click('Call /me');
+    m = await main();
+    check('Call /me with the access token -> 200', m.includes('/me with the access token -> 200'));
+
+    // 4. Step-up to AAL2: MFA only.
+    await click('Sign in + MFA (AAL2)');
+    const s2 = await throughCore();
+    m = await main();
+    check('Sign in + MFA: only the MFA page (password skipped), aal:2, amr has otp, same sid', s2.join(',') === 'mfa' && m.includes('aal:2') && m.includes('"otp"') && m.includes(`sid ${sid1}`), `${s2.join(',')} | ${m.slice(0, 200)}`);
+
+    // 5. SSO into a demo app of the same realm.
+    const amsSso = await signIn(cp, 'ams-admin', 'Sign in (AAL1)', USER, pw(USER));
+    check('SSO: AMS Admin signs in silently with the same Core session', amsSso.seen.length === 0 && String(amsSso.claims?.sid).startsWith(sid1 ?? '-'), amsSso.seen.join(','));
+
+    // 6. Handoff OUT: new client -> AMS Admin.
+    await cp.goto(TEST_APP);
+    await cp.locator('form[action="/try/handoff-out"] select[name="target"]').selectOption('ams-admin-dev');
+    await cp.locator('form[action="/try/handoff-out"] select[name="path"]').selectOption('/events/123');
+    await Promise.all([cp.waitForURL((u) => u.toString().startsWith('http://localhost:5174/'), { timeout: 15_000 }), cp.getByRole('button', { name: 'Open via handoff' }).click()]);
+    const landed = (await cp.locator('main').innerText()).replace(/\s+/g, ' ');
+    check('Handoff out: lands on AMS Admin /events/123, arrived from the new client, no login', cp.url() === 'http://localhost:5174/events/123' && landed.includes(UI_CLIENT) && landed.includes('trusted handoff'), `${cp.url()} ${landed.slice(0, 160)}`);
+
+    // 7. Handoff IN: RMS Admin -> new client.
+    await cp.goto(TEST_APP);
+    await Promise.all([cp.waitForURL((u) => u.toString().startsWith(TEST_APP), { timeout: 15_000 }), cp.getByRole('link', { name: 'RMS Admin', exact: true }).click()]);
+    m = await main();
+    check('Handoff in: RMS Admin opens /dashboard of the new client, assertion verified, no password', m.includes('Handoff from rms-admin-dev verified') && m.includes('via handoff from rms-admin-dev'), m.slice(0, 300));
+
+    // 8. Handoff to the other realm is refused.
+    await cp.locator('form[action="/try/handoff-out"] select[name="target"]').selectOption('rms-mumin-dev');
+    await Promise.all([cp.waitForURL((u) => u.toString().startsWith(TEST_APP), { timeout: 15_000 }), cp.getByRole('button', { name: 'Open via handoff' }).click()]);
+    check('Handoff to a MUMIN app -> refused by Core (REALM_MISMATCH)', (await main()).includes('REALM_MISMATCH'));
+
+    // 9. Logout from the new client: realm-wide, back-channel to the new client and AMS Admin.
+    await click('Logout');
+    await cp.waitForURL((u) => u.toString().startsWith(TEST_APP), { timeout: 15_000 });
+    m = await main();
+    check('Logout (id_token_hint) -> back from Core, local session ended', m.includes('Back from Core /logout') && m.includes('Not signed in'));
+    const bcOk = await waitFor(async () => {
+      await cp.goto(TEST_APP);
+      return (await main()).includes('Back-channel logout from Core verified') ? true : null;
+    }, 15_000);
+    check('New client receives and verifies its back-channel logout (signed miqaat-logout+jwt)', Boolean(bcOk));
+    const amsGone = await waitFor(async () => ((await state()).apps.find((a) => a.key === 'ams-admin')!.session ? null : true), 10_000);
+    check('AMS Admin signed out too (realm-wide logout, back-channel)', Boolean(amsGone));
+    const uiDeliveries = (await dbQuery(
+      `SELECT d.client_id, d.status FROM logout_deliveries d JOIN logout_jobs j ON j.id = d.job_id WHERE j.initiated_by_client = $1 ORDER BY j.created_at DESC LIMIT 5`,
+      [UI_CLIENT],
+    ).catch(() => [])) as { client_id: string; status: string }[];
+    check('Core logout deliveries: new client + AMS Admin SUCCEEDED', uiDeliveries.some((d) => d.client_id === UI_CLIENT && d.status === 'SUCCEEDED') && uiDeliveries.some((d) => d.client_id === 'ams-admin-dev' && d.status === 'SUCCEEDED'), JSON.stringify(uiDeliveries));
+    await click('Sign in (AAL1)');
+    const s3 = await throughCore();
+    check('After logout, sign-in asks for the password again', s3[0] === 'login' && (await main()).includes(`Signed in as ITS ${USER}`), s3.join(','));
+
+    // 10. Duplicate registration, secret rotation, suspend / activate.
+    await cp.goto(`${CONSOLE}/#clients`);
+    await cp.waitForSelector(`#clientrows tr:has-text("${UI_CLIENT}")`);
+    await form.locator('input[name="clientId"]').fill(UI_CLIENT);
+    await form.getByRole('button', { name: 'Register client' }).click();
+    await cp.waitForSelector('#regresult .box.bad');
+    check('Registering the same client ID again -> "already exists" in the page', (await cp.locator('#regresult').innerText()).includes('already exists'));
+    await cp.locator(`#clientrows tr:has-text("${UI_CLIENT}")`).getByRole('button', { name: 'New secret' }).click();
+    await cp.waitForFunction(`(document.getElementById('newsecret')?.textContent ?? '${secret1}') !== '${secret1}'`);
+    const secret2 = (await cp.locator('#newsecret').innerText()).trim();
+    const tokenWith = async (secret: string) =>
+      (await fetch('http://localhost:4000/token', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: `Basic ${Buffer.from(`${UI_CLIENT}:${secret}`).toString('base64')}` },
+        body: new URLSearchParams({ grant_type: 'authorization_code', code: 'not-a-code', redirect_uri: `${CONSOLE}/try/callback`, code_verifier: 'x'.repeat(43) }),
+      }).then((r) => r.json())) as { error?: string };
+    check('New secret: old secret -> invalid_client, new secret authenticates (invalid_grant for a fake code)', (await tokenWith(secret1)).error === 'invalid_client' && (await tokenWith(secret2)).error === 'invalid_grant');
+    await cp.goto(TEST_APP);
+    await click('Sign in (AAL1)');
+    await throughCore();
+    check('Sign-in with the new secret works (silent SSO)', (await main()).includes(`Signed in as ITS ${USER}`));
+
+    await cp.goto(`${CONSOLE}/#clients`);
+    await cp.waitForSelector(`#clientrows tr:has-text("${UI_CLIENT}")`);
+    await cp.locator(`#clientrows tr:has-text("${UI_CLIENT}")`).getByRole('button', { name: 'Suspend' }).click();
+    await cp.waitForSelector(`#clientrows tr:has-text("${UI_CLIENT}") >> text=SUSPENDED`);
+    await cp.goto(`${CONSOLE}/try/login?client_id=${UI_CLIENT}`);
+    await cp.waitForLoadState('load');
+    check('Suspended -> Core refuses the client (stays on a Core error page)', cp.url().startsWith('http://localhost:4000') && !(await cp.locator('body').innerText()).includes('Signed in'), cp.url());
+    check('Suspended -> the secret no longer authenticates at /token', (await tokenWith(secret2)).error === 'invalid_client');
+    await cp.goto(`${CONSOLE}/#clients`);
+    await cp.waitForSelector(`#clientrows tr:has-text("${UI_CLIENT}")`);
+    await cp.locator(`#clientrows tr:has-text("${UI_CLIENT}")`).getByRole('button', { name: 'Activate' }).click();
+    await cp.waitForSelector(`#clientrows tr:has-text("${UI_CLIENT}") >> text=ACTIVE`);
+    await cp.goto(TEST_APP);
+    await click('Sign in (AAL1)');
+    await throughCore();
+    check('Activate -> signs in again', (await main()).includes(`Signed in as ITS ${USER}`));
+    const crossSite = await fetch(`${CONSOLE}/api/clients`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-test-console': '1', origin: 'https://evil.example' }, body: '{}' });
+    check('Registration API refuses requests from another origin (403)', crossSite.status === 403);
+    await deleteUiClient();
   } finally {
     await browser.close();
   }

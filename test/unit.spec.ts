@@ -131,6 +131,13 @@ describe('configuration rules', () => {
     expect(() => parseEnv({ ...BASE_ENV, SSO_COOKIE_MUMIN: 'miqaat-admin-sso' })).toThrow(/different cookies/);
     expect(() => parseEnv({ ...BASE_ENV, NODE_ENV: 'production' })).toThrow(/production/);
   });
+
+  it('client authentication: client_secret_basic by default, others only when listed', () => {
+    expect(parseEnv({ ...BASE_ENV }).CLIENT_AUTH_METHODS).toEqual(['client_secret_basic']);
+    expect(parseEnv({ ...BASE_ENV, CLIENT_AUTH_METHODS: ' client_secret_basic , private_key_jwt,client_secret_basic' }).CLIENT_AUTH_METHODS).toEqual(['client_secret_basic', 'private_key_jwt']);
+    expect(() => parseEnv({ ...BASE_ENV, CLIENT_AUTH_METHODS: 'none' })).toThrow(/CLIENT_AUTH_METHODS/);
+    expect(() => parseEnv({ ...BASE_ENV, CLIENT_AUTH_METHODS: ',' })).toThrow(/CLIENT_AUTH_METHODS/);
+  });
 });
 
 describe('MFA policy', () => {

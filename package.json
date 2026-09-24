@@ -30,7 +30,8 @@
     "console": "ts-node -r tsconfig-paths/register scripts/test-console.ts",
     "test:browser": "ts-node -r tsconfig-paths/register scripts/browser-check.ts",
     "client:add-uri": "ts-node -r tsconfig-paths/register scripts/client-add-uri.ts",
-    "client:handoff": "ts-node -r tsconfig-paths/register scripts/client-handoff.ts"
+    "client:handoff": "ts-node -r tsconfig-paths/register scripts/client-handoff.ts",
+    "client:rotate-secret": "ts-node -r tsconfig-paths/register scripts/client-rotate-secret.ts"
   },
   "dependencies": {
     "@aws-sdk/client-kms": "^3.1139.0",

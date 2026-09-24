@@ -6,6 +6,9 @@ const bool = (fallback: boolean) =>
     .optional()
     .transform((v) => (v === undefined ? fallback : v === 'true' || v === '1'));
 
+export const CLIENT_AUTH_METHOD_VALUES = ['client_secret_basic', 'private_key_jwt', 'client_secret_post'] as const;
+export type ClientAuthMethod = (typeof CLIENT_AUTH_METHOD_VALUES)[number];
+
 const int = (fallback: number, min = 0) => z.coerce.number().int().min(min).default(fallback);
 
 const csv = z
@@ -72,6 +75,17 @@ export const envSchema = z
     OIDC_COOKIE_KEYS: csv.refine((keys) => keys.length > 0 && keys.every((k) => k.length >= 32), 'OIDC_COOKIE_KEYS needs at least one key of 32+ characters'),
     /** HMAC key for the SSR form CSRF tokens (32+ chars). */
     CSRF_SECRET: z.string().min(32),
+    /**
+     * Client authentication methods Core accepts at /token and at the handoff API (comma separated).
+     * Standard: client_secret_basic only. private_key_jwt / client_secret_post can be re-enabled here;
+     * a client registered for a method that is not listed cannot authenticate.
+     */
+    CLIENT_AUTH_METHODS: z
+      .string()
+      .default('client_secret_basic')
+      .transform((v) => [...new Set(v.split(',').map((s) => s.trim()).filter(Boolean))])
+      .refine((v) => v.length > 0 && v.every((m) => (CLIENT_AUTH_METHOD_VALUES as readonly string[]).includes(m)), 'CLIENT_AUTH_METHODS: one or more of client_secret_basic, private_key_jwt, client_secret_post')
+      .transform((v) => v as ClientAuthMethod[]),
 
     // --- Tokens -----------------------------------------------------------------------------
     AUTH_CODE_TTL_SECONDS: int(60, 10),

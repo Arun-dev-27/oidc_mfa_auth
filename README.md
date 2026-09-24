@@ -27,7 +27,7 @@ permissions) stays in each Business Unit.
 | `GET /.well-known/openid-configuration` | oidc-provider | discovery |
 | `GET /.well-known/jwks.json` | oidc-provider | public signing keys |
 | `GET/POST /auth` | oidc-provider | authorization endpoint |
-| `POST /token` | oidc-provider | code exchange (`client_secret_basic`, `client_secret_post`, `private_key_jwt`) |
+| `POST /token` | oidc-provider | code exchange, client authenticated with `client_secret_basic` (standard; see Client authentication) |
 | `GET /me` | oidc-provider | userinfo |
 | `POST /token/revocation` | oidc-provider | token revocation |
 | `GET /interaction/:uid` | Nest SSR | realm gate: silent SSO, login page or MFA page |
@@ -153,11 +153,37 @@ to see SSO and realm isolation. `--password-from-db` is refused when `NODE_ENV=p
 1. Redirect to `/auth` with `response_type=code`, `client_id`, exact `redirect_uri`, `scope=openid [profile]`,
    `state`, `nonce`, `code_challenge` (S256) and, for sensitive pages, `acr_values=urn:miqaat:aal:2`
    (optionally `mfa_max_age=<seconds>`).
-2. On the callback, check `state`, then `POST /token` with the code, `code_verifier` and client authentication.
+2. On the callback, check `state`, then `POST /token` with the code, `code_verifier` and
+   `Authorization: Basic base64(client_id:client_secret)`.
 3. Verify the ID token with the JWKS (RS256 only): `iss`, `aud` = own client_id, `exp`, `nonce`, and `acr`
    for the page's policy. `sub` is the ITS ID; keep `sid` in the local session.
 4. Apply the BU's own roles and permissions (Core never does).
 5. Step-up later = repeat step 1 with `acr_values=urn:miqaat:aal:2`: the password is skipped (SSO), only MFA runs.
+
+## Client authentication (client_secret_basic)
+
+Every Business Unit backend authenticates to Core with **`client_secret_basic`**: the secret issued at
+registration, sent as `Authorization: Basic base64(url-encoded client_id ":" url-encoded client_secret)`.
+It is used at `POST /token` and `POST /v1/handoff/requests`. The browser never sees the secret.
+
+```
+POST /token
+Authorization: Basic cm1zLWFkbWluLWRldjo8c2VjcmV0Pg==
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code&code=…&redirect_uri=…&code_verifier=…
+```
+
+| Setting / command | Purpose |
+|---|---|
+| `CLIENT_AUTH_METHODS=client_secret_basic` (default) | Methods Core accepts, comma separated. Only Basic is advertised in discovery; a secret in the body (`client_secret_post`) or a client assertion (`private_key_jwt`) is refused, and a client registered for a method that is not enabled cannot sign in. `private_key_jwt` / `client_secret_post` can be switched back on here without code changes. |
+| `npm run client:register -- … ` | Defaults to `--auth-method client_secret_basic`; prints the 64-hex secret **once**. |
+| `npm run client:rotate-secret -- --client-id X` | New secret, printed once; the old one stops working at once (update the BU secret store, then restart the BU). Moves a client from another method to Basic. |
+
+Secrets are stored encrypted (AES-256-GCM with `DATA_ENCRYPTION_KEY`), never in clear and never logged. In
+production keep `DATA_ENCRYPTION_KEY` in AWS Secrets Manager / KMS and each client secret in the BU's own
+secret store. Note: when `client_secret_post` is also enabled, oidc-provider treats the two secret methods as
+equivalent at `/token` (the handoff API still enforces the registered method).
 
 ## Docker
 
@@ -216,8 +242,8 @@ Register the URIs: `npm run client:add-uri -- --client-id X --type POST_LOGOUT_R
 Opens a page of another app of the **same realm** (e.g. RMS Admin → AMS Admin `/events/123`) without a
 second login and without passing tokens between apps.
 
-1. **Source backend** → `POST /v1/handoff/requests`, authenticated as itself (`client_secret_basic`,
-   `client_secret_post` or `private_key_jwt`; the client assertion `jti` is one-time). Body:
+1. **Source backend** → `POST /v1/handoff/requests`, authenticated as itself with `client_secret_basic`
+   (`private_key_jwt` / `client_secret_post` only if enabled in `CLIENT_AUTH_METHODS`). Body:
    `{ "target_client_id": "ams-admin-dev", "requested_path": "/events/123" }`. The source **never** sends
    the ITS ID. Core checks: source active + outbound enabled; target exists, active, inbound enabled, has a
    callback; same environment; same realm; and the path (relative, no `//`, `\`, `..`, `%2e%2e`, schemes,
@@ -297,6 +323,24 @@ delivers the assertion to the target app, which verifies it and opens the page (
 the demo target authorization; a MUMIN target is refused by Core with `REALM_MISMATCH`). Client secrets are read from
 `.e2e-<app>.txt`. Refuses to run with NODE_ENV=production.
 
+**Client registration** panel (`http://localhost:5170/#clients`) — the UI form of `npm run client:register`
+(both use `scripts/lib/client-admin.ts`, so the rules are identical):
+
+* Form: client ID, name, realm, environment, business unit, default assurance, redirect / post-logout /
+  back-channel URIs, scopes, client authentication (`client_secret_basic` standard; `private_key_jwt` with a
+  JWKS URI or public JWKS) and optional trusted handoff (start / receive, callback URI, allowed paths).
+* On success the **secret is shown once**, with the exact `Authorization: Basic …` header the app must send.
+  Errors (invalid ID, realm, non-https or wildcard URIs, duplicate client, missing handoff callback …) are
+  shown in the page and nothing is written.
+* Registered clients table: realm, method, status, URIs, handoff, whether Core can use it (and why not),
+  and actions **Open test app**, **New secret** (rotation, old secret stops at once) and **Suspend / Activate**.
+* **Use console test URLs** points the new client's redirect, post-logout, back-channel and handoff URIs at
+  the console's **test app** (`/try?client_id=…`), which then plays that client's backend: Sign in (AAL1),
+  Sign in + MFA (AAL2 step-up), Call `/me`, Logout (realm-wide, its back-channel logout is received and
+  verified), handoff **out** to a demo app and handoff **in** from a demo app, with a log of every step.
+* The API behind it only accepts JSON requests from the console page (custom header + Origin check), so
+  another web site cannot register clients through your browser. There is no delete.
+
 ## Tests
 
 ```bash
@@ -305,20 +349,22 @@ npm run build && npm run test:e2e
 npm run test:browser             # real Edge through the Test Console (service + console running)
 ```
 
-`test:e2e` (`scripts/e2e-suite.ts`, development databases only) starts the built service 19 times
-with different settings and runs **229 checks** end to end: discovery / JWKS / health; first login;
+`test:e2e` (`scripts/e2e-suite.ts`, development databases only) starts the built service 20 times
+with different settings and runs **242 checks** end to end: discovery / JWKS / health; first login;
 SSO; ADMIN vs MUMIN isolation; step-up; MFA reuse and stale MFA; client `default_acr`; Email / SMS /
 TOTP; resend + cooldown; switch method; wrong codes and attempt limit; OTP expiry; hourly cap; no
 method available; cancel; every login rule (wrong password, inactive, unknown, malformed, allow_login,
 eligibility on/off); lockout; per-IP limit; request validation (unknown client, client without realm,
 foreign redirect_uri, missing / plain PKCE, implicit, prompt=none); token endpoint (wrong secret,
 wrong verifier, other redirect, code replay revoking issued tokens, code of another client);
-`private_key_jwt` (valid, replayed jti, wrong key); `/me`; CSRF, Origin, security headers and cookie
+client authentication (`client_secret_basic` standard: no credentials, secret in the body and
+`private_key_jwt` refused; optional methods via `CLIENT_AUTH_METHODS`: `private_key_jwt` valid / replayed jti /
+wrong key; secret rotation: old secret refused at once, new secret works); `/me`; CSRF, Origin, security headers and cookie
 flags; session cookie rotation; idle and absolute expiry; Redis loss (rebuild from PostgreSQL); SMS
 HTTP gateway (success + outage); key rotation NEXT → ACTIVE → RETIRING → RETIRED; emergency revoke
 with session revocation; KMS signing, rotation and revoke on LocalStack; audit events, hashed OTPs and
 no OTP / password in logs; realm logout with back-channel delivery and retries; trusted handoff
-(Basic and `private_key_jwt` source authentication, assertion claims / JWKS / 60 s, one-time URL, expiry,
+(Basic source authentication, other methods refused, assertion claims / JWKS / 60 s, one-time URL, expiry,
 login and aal:2 step-up on the handoff, cancel, cross-realm and unsafe paths, inbound / outbound
 disabled, participant recorded and notified on logout). It resets only its own `e2e-*` clients and the auth rows of the fixed test
 ITS IDs; synced tables are only read. KMS checks need LocalStack on `http://localhost:4566`.

@@ -42,7 +42,7 @@ export class AuthClient {
   @Column({ name: 'auth_realm', type: 'varchar', length: 16, nullable: true })
   authRealm: AuthRealm | null;
 
-  /** (added) Defaults to private_key_jwt when empty. */
+  /** (added) Defaults to client_secret_basic when empty; must be enabled in CLIENT_AUTH_METHODS. */
   @Column({ name: 'token_endpoint_auth_method', type: 'varchar', length: 40, nullable: true })
   tokenEndpointAuthMethod: TokenEndpointAuthMethod | null;
 

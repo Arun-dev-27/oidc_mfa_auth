@@ -10,19 +10,22 @@ const SECRET_METHODS = new Set(['client_secret_basic', 'client_secret_post']);
 /**
  * Registered clients come from auth_clients (+ auth_client_callbacks), never from dynamic
  * registration. A client is usable only when it is ACTIVE, has an auth_realm and at least one
- * CALLBACK URI; otherwise oidc-provider answers invalid_client. The realm is exposed to the
+ * CALLBACK URI, and its token_endpoint_auth_method (default client_secret_basic) is enabled in
+ * CLIENT_AUTH_METHODS; otherwise oidc-provider answers invalid_client. The realm is exposed to the
  * provider as the custom client metadata `auth_realm` and can never come from the request.
  */
 @Injectable()
 export class ClientRegistryService {
   private readonly logger = new Logger(ClientRegistryService.name);
   private readonly dataKey: Buffer;
+  private readonly allowedMethods: ReadonlySet<string>;
 
   constructor(
     private readonly clients: ClientRepository,
     config: AppConfig,
   ) {
     this.dataKey = toKey32(config.env.DATA_ENCRYPTION_KEY);
+    this.allowedMethods = new Set(config.env.CLIENT_AUTH_METHODS);
   }
 
   async findMetadata(clientId: string): Promise<AdapterPayload | undefined> {
@@ -58,7 +61,11 @@ export class ClientRegistryService {
     const redirectUris = c.callbacks.filter((cb) => cb.uriType === 'CALLBACK').map((cb) => cb.uri);
     if (!redirectUris.length) return undefined;
 
-    const method = c.tokenEndpointAuthMethod ?? 'private_key_jwt';
+    const method = c.tokenEndpointAuthMethod ?? 'client_secret_basic';
+    if (!this.allowedMethods.has(method)) {
+      this.logger.warn(`client ${c.clientId} uses ${method}, which is not enabled in CLIENT_AUTH_METHODS; it is rejected`);
+      return undefined;
+    }
     const metadata: AdapterPayload = {
       client_id: c.clientId,
       client_name: c.name,

@@ -381,6 +381,23 @@ function keysCli(env: Record<string, string>, ...argv: string[]): string {
   return out.stdout;
 }
 
+function rotateSecret(clientId: string): string {
+  const out = spawnSync(process.execPath, ['-r', 'ts-node/register/transpile-only', '-r', 'tsconfig-paths/register', 'scripts/client-rotate-secret.ts', '--client-id', clientId], {
+    env: process.env,
+    encoding: 'utf8',
+  });
+  if (out.status !== 0) throw new Error(out.stderr || out.stdout);
+  return out.stdout;
+}
+
+const basicAuth = (c: TestClient) => `Basic ${Buffer.from(`${encodeURIComponent(c.clientId)}:${encodeURIComponent(c.secret ?? '')}`).toString('base64')}`;
+
+/** POST /token with exactly the given form and headers (no client authentication added). */
+async function rawToken(form: Record<string, string>, headers: Record<string, string>) {
+  const res = await fetch(`${ISSUER}/token`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers }, body: new URLSearchParams(form).toString() });
+  return { status: res.status, body: (await res.json().catch(() => ({}))) as Record<string, string> };
+}
+
 // ---- profiles -------------------------------------------------------------------------------------
 
 /** Settings shared by every run: dev outboxes and no incidental throttling. */
@@ -442,7 +459,7 @@ async function main() {
       check('jwks_uri is /.well-known/jwks.json', d.jwks_uri === `${ISSUER}/.well-known/jwks.json`);
       check('userinfo endpoint /me advertised', d.userinfo_endpoint === `${ISSUER}/me`);
       const methods = d.token_endpoint_auth_methods_supported as string[];
-      check('client auth: private_key_jwt + client_secret_basic, never "none"', methods.includes('private_key_jwt') && methods.includes('client_secret_basic') && !methods.includes('none'));
+      check('client auth: client_secret_basic only (standard), never "none"', same(methods, ['client_secret_basic']), JSON.stringify(methods));
       for (const c of ['sub', 'auth_realm', 'sid', 'acr', 'amr']) check(`claim "${c}" supported`, (d.claims_supported as string[]).includes(c));
     });
     await scenario('jwks', async () => {
@@ -698,21 +715,19 @@ async function main() {
       check('different redirect_uri -> refused', wrongRedirect.status >= 400);
     });
 
-    await scenario('private_key_jwt client authentication', async () => {
+    await scenario('client_secret_basic is the standard client authentication', async () => {
       const b = new Browser();
-      const out = await runFlow(b, pkjwt, M.main, {});
-      const assertion = await clientAssertion(pkjwt);
-      const code1 = out.step.callback!.searchParams.get('code')!;
-      const ok = await exchange(pkjwt, code1, out.flow.verifier, { assertion });
-      check('token with a signed client assertion = 200', ok.status === 200 && Boolean(ok.body.id_token), `${ok.status} ${ok.body.error_description ?? ''}`);
-      const again = await runFlow(b, pkjwt, M.main, {});
-      const replay = await exchange(pkjwt, again.step.callback!.searchParams.get('code')!, again.flow.verifier, { assertion });
-      check('replayed assertion (same jti) -> invalid_client', replay.status === 401 && replay.body.error === 'invalid_client', `${replay.status} ${replay.body.error}`);
-      const third = await runFlow(b, pkjwt, M.main, {});
-      const { privateKey: wrongKey } = await generateKeyPair('RS256');
-      const forged = await clientAssertion(pkjwt, { key: wrongKey });
-      const bad = await exchange(pkjwt, third.step.callback!.searchParams.get('code')!, third.flow.verifier, { assertion: forged });
-      check('assertion signed with another key -> invalid_client', bad.status === 401 && bad.body.error === 'invalid_client');
+      const out = await runFlow(b, admin, M.main, {});
+      const code = out.step.callback!.searchParams.get('code')!;
+      const form = { grant_type: 'authorization_code', code, redirect_uri: admin.redirectUri, code_verifier: out.flow.verifier };
+      const none = await rawToken(form, {});
+      check('/token without client credentials -> refused (400 invalid_request), no token', none.status === 400 && none.body.error === 'invalid_request' && !none.body.id_token, JSON.stringify(none));
+      const post = await rawToken({ ...form, client_id: admin.clientId, client_secret: admin.secret! }, {});
+      check('client_secret_post (secret in the body) -> 401 invalid_client', post.status === 401 && post.body.error === 'invalid_client', `${post.status} ${post.body.error}`);
+      const basic = await rawToken(form, { authorization: basicAuth(admin) });
+      check('the same code with Authorization: Basic -> 200', basic.status === 200 && typeof basic.body.id_token === 'string', `${basic.status} ${basic.body.error ?? ''}`);
+      const pk = await start(new Browser(), pkjwt, {});
+      check('a client registered for private_key_jwt is unusable while the method is disabled (400, no redirect)', pk.step.page?.status === 400 && !pk.step.callback);
     });
 
     await scenario('CSRF and security headers', async () => {
@@ -1133,6 +1148,69 @@ async function main() {
   });
 
   // ------------------------------------------------------------------------------------------------
+  await profile('12b. Optional client auth methods + secret rotation', { CLIENT_AUTH_METHODS: 'client_secret_basic,private_key_jwt,client_secret_post' }, async () => {
+    const { admin, admin2, pkjwt } = clients;
+    await scenario('methods enabled through CLIENT_AUTH_METHODS', async () => {
+      const d = (await (await fetch(`${ISSUER}/.well-known/openid-configuration`)).json()) as Record<string, unknown>;
+      check('discovery lists the three enabled methods', same([...(d.token_endpoint_auth_methods_supported as string[])].sort(), ['client_secret_basic', 'client_secret_post', 'private_key_jwt']));
+      // At /token oidc-provider treats the two secret methods as equivalent once both are enabled;
+      // Core's own handoff API holds the client to its registered method.
+      const post = await fetch(`${ISSUER}/v1/handoff/requests`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ target_client_id: admin2.clientId, requested_path: '/dashboard', client_id: admin.clientId, client_secret: admin.secret }),
+      });
+      check('handoff API: a client_secret_basic client cannot use client_secret_post (401)', post.status === 401);
+      const assertion = await clientAssertion(pkjwt, { aud: `${ISSUER}/v1/handoff/requests` });
+      const body = { target_client_id: admin2.clientId, requested_path: '/dashboard', client_id: pkjwt.clientId, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: assertion };
+      const send = async () => (await fetch(`${ISSUER}/v1/handoff/requests`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })).status;
+      check('handoff request with a client assertion (private_key_jwt) -> 201', (await send()) === 201);
+      check('replayed handoff client assertion (same jti) -> 401', (await send()) === 401);
+    });
+
+    await scenario('private_key_jwt client authentication (when enabled)', async () => {
+      const b = new Browser();
+      const out = await runFlow(b, pkjwt, M.main, {});
+      const assertion = await clientAssertion(pkjwt);
+      const code1 = out.step.callback!.searchParams.get('code')!;
+      const ok = await exchange(pkjwt, code1, out.flow.verifier, { assertion });
+      check('token with a signed client assertion = 200', ok.status === 200 && Boolean(ok.body.id_token), `${ok.status} ${ok.body.error_description ?? ''}`);
+      const again = await runFlow(b, pkjwt, M.main, {});
+      const replay = await exchange(pkjwt, again.step.callback!.searchParams.get('code')!, again.flow.verifier, { assertion });
+      check('replayed assertion (same jti) -> invalid_client', replay.status === 401 && replay.body.error === 'invalid_client', `${replay.status} ${replay.body.error}`);
+      const third = await runFlow(b, pkjwt, M.main, {});
+      const { privateKey: wrongKey } = await generateKeyPair('RS256');
+      const forged = await clientAssertion(pkjwt, { key: wrongKey });
+      const bad = await exchange(pkjwt, third.step.callback!.searchParams.get('code')!, third.flow.verifier, { assertion: forged });
+      check('assertion signed with another key -> invalid_client', bad.status === 401 && bad.body.error === 'invalid_client');
+    });
+
+    await scenario('client secret rotation', async () => {
+      const b = new Browser();
+      const old = admin2.secret!;
+      const out = rotateSecret(admin2.clientId);
+      const fresh = out.match(/shown once[^:]*: (\S+)/)?.[1] ?? '';
+      check('client:rotate-secret prints a new 64-hex secret once', /^[0-9a-f]{64}$/.test(fresh) && fresh !== old);
+      const [row] = await AppDataSource.query('SELECT client_secret_enc, token_endpoint_auth_method FROM auth_clients WHERE client_id = $1', [admin2.clientId]);
+      check('stored encrypted, never in clear', typeof row?.client_secret_enc === 'string' && !row.client_secret_enc.includes(fresh) && row.token_endpoint_auth_method === 'client_secret_basic');
+      let x = await runFlow(b, admin2, M.main, {});
+      const withOld = await exchange(admin2, x.step.callback!.searchParams.get('code')!, x.flow.verifier, { secret: old });
+      check('the old secret stops working immediately -> 401 invalid_client', withOld.status === 401 && withOld.body.error === 'invalid_client', `${withOld.status}`);
+      admin2.secret = fresh;
+      x = await runFlow(b, admin2, M.main, {});
+      const withNew = await exchange(admin2, x.step.callback!.searchParams.get('code')!, x.flow.verifier);
+      check('the new secret works at /token', withNew.status === 200 && Boolean(withNew.body.id_token));
+      let err = '';
+      try {
+        rotateSecret('no-such-client');
+      } catch (e) {
+        err = e instanceof Error ? e.message : String(e);
+      }
+      check('rotating an unknown client fails', /unknown client/.test(err));
+    });
+  });
+
+  // ------------------------------------------------------------------------------------------------
   await profile('13. Trusted handoff', { HANDOFF_REQUEST_TTL_SECONDS: '5', LOGOUT_WORKER_INTERVAL_MS: '250' }, async () => {
     const { admin, admin2, mumin, aal2, pkjwt } = clients;
     const TYP = 'miqaat-handoff+jwt';
@@ -1202,15 +1280,14 @@ async function main() {
       check('a used URL opened in another browser gets no assertion either', other.page?.kind !== 'handoff');
     });
 
-    await scenario('private_key_jwt source authentication', async () => {
-      const [bad] = [await request({ target_client_id: admin2.clientId, requested_path: '/dashboard' })];
+    await scenario('source authentication: client_secret_basic only', async () => {
+      const bad = await request({ target_client_id: admin2.clientId, requested_path: '/dashboard' });
       check('no client authentication -> 401 SOURCE_CLIENT_INVALID', bad.status === 401 && bad.body.error === 'SOURCE_CLIENT_INVALID');
+      const post = await request({ target_client_id: admin2.clientId, requested_path: '/dashboard', client_id: admin.clientId, client_secret: admin.secret });
+      check('client_secret_post body credentials -> 401 (method not enabled)', post.status === 401);
       const assertion = await clientAssertion(pkjwt, { aud: `${ISSUER}/v1/handoff/requests` });
-      const body = { target_client_id: admin2.clientId, requested_path: '/dashboard', client_id: pkjwt.clientId, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: assertion };
-      const ok = await request(body);
-      check('client assertion (private_key_jwt) -> 201', ok.status === 201, JSON.stringify(ok.body));
-      const replay = await request(body);
-      check('replayed client assertion (same jti) -> 401', replay.status === 401);
+      const pk = await request({ target_client_id: admin2.clientId, requested_path: '/dashboard', client_id: pkjwt.clientId, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: assertion });
+      check('private_key_jwt client assertion -> 401 (method not enabled)', pk.status === 401);
     });
 
     await scenario('request validation', async () => {

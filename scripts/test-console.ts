@@ -11,7 +11,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { createRemoteJWKSet, decodeProtectedHeader, jwtVerify } from 'jose';
 import { Pool } from 'pg';
@@ -20,6 +20,8 @@ import { decryptString, toKey32 } from '../src/common/crypto.util';
 import { decrypt } from '../src/modules/identity/legacy-password-cipher';
 import { base32Decode, hotp } from '../src/modules/mfa/totp';
 import { isAllowedPath, normalizeRelativePath } from '../src/modules/handoff/handoff-path';
+import AppDataSource from '../src/database/data-source';
+import { listClients, registerClient, rotateClientSecret, setClientStatus, type RegisterInput } from './lib/client-admin';
 
 loadDotEnv();
 if (process.env.NODE_ENV === 'production') throw new Error('the test console is for local development only');
@@ -354,7 +356,7 @@ const TARGET_PATHS = ['/dashboard', '/events/*', '/events/*/details', '/bookings
 const handoffJti = new Map<string, number>();
 
 /** Handoff spec §14, in order. Any failure: no local session, no redirect to the requested path. */
-async function verifyHandoff(app: App, assertion: string): Promise<
+async function verifyHandoff(app: Pick<App, 'clientId' | 'realm'>, assertion: string): Promise<
   { ok: true; claims: Record<string, unknown>; kid: string | undefined; denied: boolean } | { ok: false; code: string }
 > {
   if (!assertion) return { ok: false, code: 'HANDOFF_MISSING' };
@@ -542,11 +544,316 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     res.writeHead(204).end();
     return;
   }
+  // ---- client registration (same rules as npm run client:register) ------------------------------
+  if (url.pathname === '/api/clients' && req.method === 'GET') {
+    return json(res, 200, { clients: await listClients(AppDataSource), tryRedirect: TRY_REDIRECT, tryLoggedOut: TRY_LOGGED_OUT, tryBase: `http://localhost:${CONSOLE_PORT}/try`, trySecrets: [...trySecrets.keys()] });
+  }
+  if (url.pathname.startsWith('/api/clients')) {
+    if (!sameOriginJson(req)) return json(res, 403, { error: 'Requests must come from the Test Console page' });
+    try {
+      if (url.pathname === '/api/clients' && req.method === 'POST') {
+        const r = await registerClient(AppDataSource, JSON.parse(await readBody(req)) as RegisterInput);
+        if (r.secret) trySecrets.set(r.clientId, r.secret);
+        return json(res, 201, r);
+      }
+      const clientId = url.searchParams.get('client_id') ?? '';
+      if (url.pathname === '/api/clients/rotate-secret' && req.method === 'POST') {
+        const r = await rotateClientSecret(AppDataSource, clientId);
+        trySecrets.set(clientId, r.secret);
+        const demo = apps.find((a) => a.clientId === clientId);
+        if (demo) {
+          // Keep the demo app card working, now and after a console restart.
+          demo.secret = r.secret;
+          await writeFile(demo.secretFile, `rotated ${clientId} in the Test Console\nclient_secret (shown once, store it in the BU secret store): ${r.secret}\n`, { mode: 0o600 });
+        }
+        return json(res, 200, { clientId, secret: r.secret, previousMethod: r.previousMethod });
+      }
+      if (url.pathname === '/api/clients/status' && req.method === 'POST') {
+        await setClientStatus(AppDataSource, clientId, url.searchParams.get('status') ?? '');
+        return json(res, 200, { clientId, status: url.searchParams.get('status') });
+      }
+    } catch (error) {
+      return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+    }
+    return json(res, 404, { error: 'not found' });
+  }
+
+  // ---- Test app for any client registered here: /try?client_id=X ------------------------------------
+  // Plays the new client's backend: sign-in (AAL1 / AAL2), /me, logout + back-channel, handoff in and out.
+  if (url.pathname === '/try') {
+    const clientId = url.searchParams.get('client_id') ?? '';
+    return tryDashboard(res, clientId);
+  }
+  if (url.pathname === '/try/login') {
+    const clientId = url.searchParams.get('client_id') ?? '';
+    if (!trySecrets.has(clientId)) return tryPage(res, 400, clientId, '<p class="err">No secret for this client in this console session. Register it here or use "New secret" first.</p>');
+    const verifier = randomBytes(32).toString('base64url');
+    const state = randomBytes(12).toString('base64url');
+    const nonce = randomBytes(12).toString('base64url');
+    const acr = url.searchParams.get('acr') ?? '';
+    tryPending.set(state, { clientId, verifier, nonce });
+    tryEvent(clientId, `Sign-in started${acr ? ` (acr_values ${acr.replace('urn:miqaat:', '')})` : ''}: browser sent to Core /auth with PKCE S256`);
+    const q = new URLSearchParams({
+      response_type: 'code',
+      client_id: clientId,
+      redirect_uri: TRY_REDIRECT,
+      scope: 'openid profile',
+      state,
+      nonce,
+      code_challenge: createHash('sha256').update(verifier).digest('base64url'),
+      code_challenge_method: 'S256',
+      ...(acr ? { acr_values: acr } : {}),
+    });
+    res.writeHead(303, { location: `${ISSUER}/auth?${q}` }).end();
+    return;
+  }
+  if (url.pathname === '/try/callback') {
+    const flow = tryPending.get(url.searchParams.get('state') ?? '');
+    if (!flow) return tryPage(res, 400, '', '<p class="err">Unknown or used state.</p>');
+    tryPending.delete(url.searchParams.get('state') ?? '');
+    if (url.searchParams.get('error')) {
+      tryEvent(flow.clientId, `Core answered ${url.searchParams.get('error')}: ${url.searchParams.get('error_description') ?? ''}`, false);
+      return tryRedirect(res, flow.clientId);
+    }
+    const t = await fetch(`${ISSUER}/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: tryBasic(flow.clientId) },
+      body: new URLSearchParams({ grant_type: 'authorization_code', code: url.searchParams.get('code') ?? '', redirect_uri: TRY_REDIRECT, code_verifier: flow.verifier }),
+    });
+    const body = (await t.json()) as { id_token?: string; access_token?: string; error?: string; error_description?: string };
+    if (!body.id_token) {
+      tryEvent(flow.clientId, `Token exchange failed: ${t.status} ${body.error ?? ''} ${body.error_description ?? ''}`, false);
+      return tryRedirect(res, flow.clientId);
+    }
+    const { payload, protectedHeader } = await jwtVerify(body.id_token, jwks, { issuer: ISSUER, audience: flow.clientId, algorithms: ['RS256'] });
+    if (payload.nonce !== flow.nonce) {
+      tryEvent(flow.clientId, 'nonce mismatch - ID token rejected', false);
+      return tryRedirect(res, flow.clientId);
+    }
+    const me = await fetch(`${ISSUER}/me`, { headers: { authorization: `Bearer ${body.access_token}` } }).then((r) => r.json());
+    trySessions.set(flow.clientId, { claims: payload, idToken: body.id_token, accessToken: body.access_token ?? '', me, at: new Date().toISOString(), via: 'sign-in' });
+    tryEvent(flow.clientId, `Signed in: code exchanged at /token with Authorization: Basic, ID token verified (kid ${protectedHeader.kid}), ${String(payload.acr).replace('urn:miqaat:', '')}, amr ${JSON.stringify(payload.amr)}`);
+    return tryRedirect(res, flow.clientId);
+  }
+  if (url.pathname === '/try/me') {
+    const clientId = url.searchParams.get('client_id') ?? '';
+    const s = trySessions.get(clientId);
+    if (s?.accessToken) {
+      const r = await fetch(`${ISSUER}/me`, { headers: { authorization: `Bearer ${s.accessToken}` } });
+      s.me = await r.json().catch(() => ({}));
+      tryEvent(clientId, `/me with the access token -> ${r.status}${r.status === 200 ? '' : ' (token no longer valid)'}`, r.status === 200);
+    } else tryEvent(clientId, s ? '/me: this session came from a handoff - no access token (handoff never passes tokens)' : '/me: not signed in', false);
+    return tryRedirect(res, clientId);
+  }
+  if (url.pathname === '/try/logout') {
+    const clientId = url.searchParams.get('client_id') ?? '';
+    const state = randomBytes(16).toString('base64url');
+    tryLogoutState.set(state, clientId);
+    const q = new URLSearchParams({ client_id: clientId, post_logout_redirect_uri: TRY_LOGGED_OUT, state });
+    const s = trySessions.get(clientId);
+    if (s?.idToken) q.set('id_token_hint', s.idToken);
+    trySessions.delete(clientId);
+    tryEvent(clientId, `Logout: local session ended, browser sent to Core /logout${q.has('id_token_hint') ? ' (with id_token_hint)' : ' (no id_token_hint - Core asks to confirm)'}`);
+    res.writeHead(303, { location: `${ISSUER}/logout?${q}` }).end();
+    return;
+  }
+  if (url.pathname === '/try/logged-out') {
+    const clientId = tryLogoutState.get(url.searchParams.get('state') ?? '') ?? '';
+    tryLogoutState.delete(url.searchParams.get('state') ?? '');
+    if (!clientId) return tryPage(res, 400, '', '<p class="err">Back from Core with an unknown state.</p>');
+    tryEvent(clientId, 'Back from Core /logout: the whole realm session is signed out (state checked)');
+    return tryRedirect(res, clientId);
+  }
+  if (url.pathname.startsWith('/try/backchannel/') && req.method === 'POST') {
+    const clientId = decodeURIComponent(url.pathname.slice('/try/backchannel/'.length));
+    const realm = await clientRealm(clientId);
+    try {
+      const { payload } = await jwtVerify(new URLSearchParams(await readBody(req)).get('logout_token') ?? '', jwks, {
+        issuer: ISSUER,
+        audience: clientId,
+        algorithms: ['RS256'],
+        typ: 'miqaat-logout+jwt',
+        clockTolerance: 30,
+      });
+      if (payload.auth_realm !== realm || typeof payload.sid !== 'string' || typeof payload.jti !== 'string') throw new Error('wrong realm / missing sid or jti');
+      const replay = seenLogoutJti.has(payload.jti);
+      seenLogoutJti.set(payload.jti, Date.now());
+      const had = trySessions.get(clientId)?.claims.sid === payload.sid;
+      if (had) trySessions.delete(clientId);
+      tryEvent(clientId, replay ? `Back-channel logout replayed (jti ${payload.jti.slice(0, 8)}) - ignored` : `Back-channel logout from Core verified (sid ${payload.sid.slice(0, 8)}, ${String(payload.reason)}) -> ${had ? 'local session ended' : 'no local session for that sid'}`);
+      return json(res, 200, { ok: true });
+    } catch (error) {
+      tryEvent(clientId, `Back-channel logout REJECTED: ${error instanceof Error ? error.message : String(error)}`, false);
+      return json(res, 400, { error: 'invalid_logout_token' });
+    }
+  }
+  // Handoff OUT: this client (source backend, client_secret_basic) asks Core to open another app.
+  if (url.pathname === '/try/handoff-out') {
+    const clientId = url.searchParams.get('client_id') ?? '';
+    const target = url.searchParams.get('target') ?? '';
+    const path = url.searchParams.get('path') ?? '/dashboard';
+    if (!trySessions.has(clientId)) {
+      tryEvent(clientId, 'Handoff refused: sign in to this app first (a source needs a local session)', false);
+      return tryRedirect(res, clientId);
+    }
+    const r = await handoffRequest(tryBasic(clientId), target, path);
+    if (!r.url) {
+      tryEvent(clientId, `Handoff to ${target} ${path} refused by Core: ${r.error}`, false);
+      return tryRedirect(res, clientId);
+    }
+    tryEvent(clientId, `Handoff to ${target} ${path}: Core request created, browser sent to Core`);
+    res.writeHead(303, { location: r.url }).end();
+    return;
+  }
+  // Handoff IN: a demo app (source) asks Core to open this client.
+  if (url.pathname === '/try/handoff-in') {
+    const clientId = url.searchParams.get('client_id') ?? '';
+    const source = apps.find((a) => a.clientId === url.searchParams.get('source'));
+    const path = url.searchParams.get('path') ?? '/dashboard';
+    if (!source?.secret) return tryRedirect(res, clientId);
+    const r = await handoffRequest(`Basic ${Buffer.from(`${source.clientId}:${source.secret}`).toString('base64')}`, clientId, path);
+    if (!r.url) {
+      tryEvent(clientId, `Handoff from ${source.clientId} refused by Core: ${r.error}`, false);
+      return tryRedirect(res, clientId);
+    }
+    tryEvent(clientId, `${source.label} asked Core to open ${path} in this app - browser sent to Core`);
+    res.writeHead(303, { location: r.url }).end();
+    return;
+  }
+  // Handoff callback of the new client (target side, Handoff spec §14).
+  if (url.pathname.startsWith('/try/handoff/') && req.method === 'POST') {
+    const clientId = decodeURIComponent(url.pathname.slice('/try/handoff/'.length));
+    const result = await verifyHandoff({ clientId, realm: await clientRealm(clientId) }, new URLSearchParams(await readBody(req)).get('assertion') ?? '');
+    if (!result.ok) {
+      tryEvent(clientId, `Handoff REJECTED: ${result.code}`, false);
+      return tryRedirect(res, clientId);
+    }
+    const c = result.claims;
+    if (result.denied) {
+      tryEvent(clientId, `Handoff verified but ${String(c.requested_path)} denied by this app's authorization`, false);
+      return tryRedirect(res, clientId);
+    }
+    // Same Core session as the local one: keep its tokens (logout still sends id_token_hint).
+    const prev = trySessions.get(clientId);
+    const same = prev !== undefined && prev.claims.sid === c.sid;
+    trySessions.set(clientId, { claims: c, idToken: same ? prev.idToken : '', accessToken: same ? prev.accessToken : '', me: same ? prev.me : null, at: new Date().toISOString(), via: `handoff from ${String(c.source_client_id)}` });
+    tryEvent(clientId, `Handoff from ${String(c.source_client_id)} verified (JWKS, aud, one-time jti) -> local session for ITS ${String(c.sub)} at ${String(c.requested_path)}, no password`);
+    return tryRedirect(res, clientId);
+  }
+
   if (url.pathname === '/') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(PAGE);
     return;
   }
   res.writeHead(404).end();
+}
+
+const TRY_REDIRECT = `http://localhost:${CONSOLE_PORT}/try/callback`;
+const TRY_LOGGED_OUT = `http://localhost:${CONSOLE_PORT}/try/logged-out`;
+/** Secrets of clients registered / rotated in this console session (memory only, dev convenience). */
+const trySecrets = new Map<string, string>();
+const tryPending = new Map<string, { clientId: string; verifier: string; nonce: string }>();
+const tryLogoutState = new Map<string, string>();
+const trySessions = new Map<string, { claims: Record<string, unknown>; idToken: string; accessToken: string; me: unknown; at: string; via: string }>();
+const tryEvents = new Map<string, { at: string; text: string; ok: boolean }[]>();
+
+function tryEvent(clientId: string, text: string, ok = true) {
+  const list = tryEvents.get(clientId) ?? [];
+  list.unshift({ at: new Date().toISOString(), text, ok });
+  tryEvents.set(clientId, list.slice(0, 12));
+}
+
+const tryBasic = (clientId: string) => `Basic ${Buffer.from(`${encodeURIComponent(clientId)}:${encodeURIComponent(trySecrets.get(clientId) ?? '')}`).toString('base64')}`;
+
+function tryRedirect(res: ServerResponse, clientId: string) {
+  res.writeHead(303, { location: `/try?client_id=${encodeURIComponent(clientId)}` }).end();
+}
+
+async function clientRealm(clientId: string): Promise<string | null> {
+  const [row] = (await db.query('SELECT auth_realm FROM auth_clients WHERE client_id = $1', [clientId])).rows;
+  return row?.auth_realm ?? null;
+}
+
+async function handoffRequest(authorization: string, target: string, path: string): Promise<{ url?: string; error?: string }> {
+  const r = await fetch(`${ISSUER}/v1/handoff/requests`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization },
+    body: JSON.stringify({ target_client_id: target, requested_path: path }),
+  });
+  const body = (await r.json().catch(() => ({}))) as { browser_redirect_url?: string; error?: string; error_description?: string };
+  return r.status === 201 && body.browser_redirect_url ? { url: body.browser_redirect_url } : { error: `${body.error ?? r.status} ${body.error_description ?? ''}`.trim() };
+}
+
+function json(res: ServerResponse, status: number, body: unknown) {
+  res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body));
+}
+
+/**
+ * Changes only from the console page itself: JSON + a custom header force a CORS preflight that other
+ * sites cannot pass, and the Origin (when sent) must be the console.
+ */
+function sameOriginJson(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  return (
+    req.method === 'POST' &&
+    String(req.headers['content-type'] ?? '').startsWith('application/json') &&
+    req.headers['x-test-console'] === '1' &&
+    (!origin || origin === `http://localhost:${CONSOLE_PORT}`)
+  );
+}
+
+async function tryDashboard(res: ServerResponse, clientId: string) {
+  const client = (await listClients(AppDataSource)).find((c) => c.clientId === clientId);
+  if (!client) return tryPage(res, 404, clientId, '<p class="err">Unknown client.</p>');
+  const s = trySessions.get(clientId);
+  const id = encodeURIComponent(clientId);
+  const hasSecret = trySecrets.has(clientId);
+  const notes: string[] = [];
+  if (!client.usable) notes.push(`Core cannot use this client: ${client.problems.join(', ')}`);
+  if (!hasSecret) notes.push('No secret in this console session - use "New secret" on the console to test it.');
+  if (!client.redirectUris.includes(TRY_REDIRECT)) notes.push(`Sign-in needs the redirect URI ${TRY_REDIRECT}.`);
+  if (!client.postLogoutUris.includes(TRY_LOGGED_OUT)) notes.push(`Logout returns to Core's "Signed out" page unless ${TRY_LOGGED_OUT} is a post-logout URI.`);
+  const others = apps.filter((a) => a.realm === client.realm);
+  const session = s
+    ? `<div class="status in"><b>Signed in</b> as ITS <b>${esc(s.claims.sub)}</b> (${esc(s.claims.name ?? '')}) · realm ${esc(s.claims.auth_realm)} · ${esc(String(s.claims.acr).replace('urn:miqaat:', ''))} · amr ${esc(JSON.stringify(s.claims.amr))} · sid <code>${esc(String(s.claims.sid).slice(0, 8))}</code> · via ${esc(s.via)}</div>
+       <details open><summary>Claims</summary><pre>${esc(JSON.stringify(s.claims, null, 2))}</pre></details>${s.me ? `<details><summary>/me</summary><pre>${esc(JSON.stringify(s.me, null, 2))}</pre></details>` : ''}`
+    : '<div class="status out">Not signed in to this app.</div>';
+  const handoffOut = client.handoff.outbound
+    ? `<form class="row" method="get" action="/try/handoff-out"><input type="hidden" name="client_id" value="${esc(clientId)}"><span>Open another app via handoff:</span>
+         <select name="target">${others.map((a) => `<option value="${esc(a.clientId)}">${esc(a.label)}</option>`).join('')}<option value="rms-mumin-dev">RMS Mumin (other realm)</option></select>
+         <select name="path"><option>/events/123</option><option>/dashboard</option><option>/admin/users</option></select><button class="btn light">Open via handoff</button></form>`
+    : '<p class="muted">Handoff out: not enabled for this client.</p>';
+  const handoffIn = client.handoff.inbound
+    ? `<div class="row"><span>Receive a handoff from:</span>${others
+        .filter((a) => a.secret)
+        .map((a) => `<a class="btn light" href="/try/handoff-in?client_id=${id}&source=${encodeURIComponent(a.clientId)}&path=%2Fdashboard">${esc(a.label)}</a>`)
+        .join('')}</div>`
+    : '<p class="muted">Handoff in: not enabled for this client.</p>';
+  const events = (tryEvents.get(clientId) ?? []).map((e) => `<li class="${e.ok ? '' : 'no'}">${new Date(e.at).toLocaleTimeString()} · ${esc(e.text)}</li>`).join('');
+  return tryPage(
+    res,
+    200,
+    clientId,
+    `<p class="muted">${esc(client.name)} · realm <b>${esc(client.realm)}</b> · ${esc(client.method)} · status <b>${esc(client.status)}</b>${client.defaultAcr ? ` · default ${esc(client.defaultAcr.replace('urn:miqaat:', ''))}` : ''}</p>
+     ${notes.length ? `<div class="status err"><ul>${notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul></div>` : ''}
+     <div class="row"><a class="btn" href="/try/login?client_id=${id}">Sign in (AAL1)</a><a class="btn gold" href="/try/login?client_id=${id}&acr=urn%3Amiqaat%3Aaal%3A2">Sign in + MFA (AAL2)</a>
+       <a class="btn light" href="/try/me?client_id=${id}">Call /me</a><a class="btn red" href="/try/logout?client_id=${id}">Logout</a><a class="btn light" href="/try?client_id=${id}">Refresh</a></div>
+     ${session}
+     <h3>Trusted handoff</h3>${handoffOut}${handoffIn}
+     <h3>What happened</h3><ul class="events">${events || '<li class="muted">Nothing yet</li>'}</ul>`,
+  );
+}
+
+function tryPage(res: ServerResponse, status: number, clientId: string, body: string) {
+  res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Test app · ${esc(clientId)}</title>
+<style>body{font-family:Mulish,system-ui,sans-serif;background:#fbf9f5;color:#1d2b33;margin:0}header{background:linear-gradient(90deg,#10232a,#215f60);color:#fff;padding:16px 24px;font-size:20px}
+main{max-width:960px;margin:24px auto;padding:0 16px}code{background:#f4f1ea;padding:2px 6px;border-radius:4px;font-size:12px}pre{background:#f4f1ea;border-radius:8px;padding:12px;font-size:12px;overflow:auto;max-height:320px}
+h3{color:#1c5a5c;margin:22px 0 8px}.err{color:#9b2c1f;font-weight:700}.muted{color:#5b6770}a{color:#1c5a5c}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}.row select{font:inherit;padding:6px;border:1px solid #e4ded3;border-radius:6px}
+.btn{border:0;cursor:pointer;font:inherit;font-size:13px;font-weight:700;padding:8px 14px;border-radius:999px;background:#1c5a5c;color:#fff;text-decoration:none}.btn.gold{background:#8a6a45}.btn.red{background:#9b2c1f}.btn.light{background:#e8efee;color:#1c5a5c}
+.status{padding:10px 12px;border-radius:10px;font-size:13.5px;margin-top:10px}.status.in{background:#f0fdf4;border:1px solid #bbf7d0}.status.out{background:#f8fafc;border:1px dashed #e4ded3;color:#5b6770}.status.err{background:#fef2f2;border:1px solid #fecaca;color:#9b2c1f}.status ul{margin:0;padding-left:18px}
+.events{background:#f8fafc;border-radius:8px;padding:10px 12px 10px 28px;font-size:12.5px}.events li{margin:3px 0}.events li.no{color:#9b2c1f}details{margin-top:8px}summary{cursor:pointer;color:#1c5a5c;font-weight:700;font-size:13px}</style></head>
+<body><header>Test app · <code style="background:rgba(255,255,255,.15);color:#fff">${esc(clientId)}</code> <small style="opacity:.7">plays the backend of the client you registered</small></header><main>${body}<p><a href="http://localhost:${CONSOLE_PORT}/#clients">Back to the Test Console</a></p></main></body></html>`);
 }
 
 const PAGE = /* html */ `<!doctype html>
@@ -580,6 +887,17 @@ table{width:100%;border-collapse:collapse;font-size:12.5px}th{text-align:left;co
 .copy{border:1px solid var(--line);background:#fff;border-radius:6px;font-size:11px;padding:2px 6px;cursor:pointer}
 .check td:first-child{width:28px}.check input{width:16px;height:16px}
 .handoff{margin-top:10px;font-size:12.5px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}.handoff select{font:inherit;font-size:12.5px;padding:4px 6px;border:1px solid var(--line);border-radius:6px}.bc{margin-top:8px;font-size:12px;color:var(--muted)}.events{margin:8px 0 0;padding:8px 10px 8px 22px;background:#f8fafc;border-radius:8px;font-size:12px}.events li{margin:2px 0}.events li.no{color:var(--bad)}
+.reg{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:18px}@media(max-width:1100px){.reg{grid-template-columns:1fr}}
+.fgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 12px}@media(max-width:700px){.fgrid{grid-template-columns:1fr}}
+.fgrid label{display:flex;flex-direction:column;gap:4px;font-size:12.5px;font-weight:700;color:var(--ink)}.fgrid label.wide{grid-column:1/-1}
+.fgrid input,.fgrid select,.fgrid textarea{font:inherit;font-size:13px;font-weight:400;padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}
+.fgrid textarea{font-family:Consolas,monospace;font-size:12px;resize:vertical}.fgrid input:focus,.fgrid select:focus,.fgrid textarea:focus{outline:2px solid #9cc5c5;border-color:var(--teal2)}
+fieldset{border:1px solid var(--line);border-radius:10px;margin:12px 0 4px;padding:8px 12px 12px}legend{font-size:12.5px;font-weight:800;color:var(--teal);padding:0 6px}
+label.inline{font-size:12.5px;margin-right:16px;display:inline-flex;gap:6px;align-items:center}
+.box{border-radius:12px;padding:14px;font-size:13px}.box.ok{background:#f0fdf4;border:1px solid #bbf7d0}.box.bad{background:#fef2f2;border:1px solid #fecaca;color:var(--bad);font-weight:700}.box.hint{background:#f8fafc;border:1px dashed var(--line);color:var(--muted)}
+.secret{font-family:Consolas,monospace;font-size:13px;word-break:break-all;background:#fff;border:1px solid #bbf7d0;border-radius:8px;padding:8px;margin:6px 0}
+.box ul{margin:6px 0 0;padding-left:18px}.box .warn{color:#92400e}
+.actions{display:flex;flex-wrap:wrap;gap:4px}.actions .copy{white-space:nowrap}
 .new{animation:flash 1.2s ease}@keyframes flash{from{background:#fef3c7}to{background:transparent}}
 </style></head>
 <body>
@@ -590,6 +908,40 @@ table{width:100%;border-collapse:collapse;font-size:12.5px}th{text-align:left;co
 <main>
 <section><h2>Applications (Business Units)</h2><div class="grid3" id="apps"></div>
 <p class="muted" style="font-size:12.5px;margin:8px 2px 0">Each app runs on its own port and signs in through Core. "Clear" forgets only the app's local session - the Core session stays, so signing in again is silent (SSO). Use a private window to start without any Core session.</p></section>
+<section class="card" id="clients"><h2>Client registration</h2>
+<p class="muted" style="font-size:12.5px;margin:0 0 12px">Registers a Business Unit application in <code>auth_clients</code> with the same rules as <code>npm run client:register</code>. Standard client authentication: <b>client_secret_basic</b> - the secret is shown <b>once</b>. Press <b>Use console test URLs</b> to point every URI at the console’s <b>test app</b>, which then plays the new client’s backend: sign-in (AAL1 / AAL2), /me, logout + back-channel and handoff in / out. Test app redirect URI: <code id="tryuri"></code>.</p>
+<div class="reg">
+<form id="regform" autocomplete="off">
+ <div class="fgrid">
+  <label>Client ID *<input name="clientId" required placeholder="ams-admin-dev" pattern="[a-z0-9][a-z0-9-]{2,63}"></label>
+  <label>Name<input name="name" placeholder="AMS Admin"></label>
+  <label>Realm *<select name="realm"><option>ADMIN</option><option>MUMIN</option></select></label>
+  <label>Environment<select name="environment"><option>DEV</option><option>UAT</option><option>PROD</option></select></label>
+  <label>Business unit<input name="businessUnit" placeholder="AMS"></label>
+  <label>Default assurance<select name="defaultAcr"><option value="">none (app decides per request)</option><option value="urn:miqaat:aal:1">aal:1 - password</option><option value="urn:miqaat:aal:2">aal:2 - password + MFA</option></select></label>
+  <label class="wide">Redirect URIs * <span class="muted">(one per line, exact match)</span><textarea name="redirectUris" rows="2" required></textarea></label>
+  <label class="wide">Post-logout URIs <span class="muted">(one per line)</span><textarea name="postLogoutUris" rows="2"></textarea></label>
+  <label class="wide">Back-channel logout URI <span class="muted">(optional, POST from Core)</span><input name="backchannelLogoutUri" placeholder="https://ams.example.com/auth/core/logout"></label>
+  <label>Scopes<input name="scopes" value="openid profile"></label>
+  <label>Client authentication<select name="authMethod" id="authMethod"><option value="client_secret_basic">client_secret_basic (standard)</option><option value="private_key_jwt">private_key_jwt (needs CLIENT_AUTH_METHODS)</option></select></label>
+  <label class="wide pk" hidden>JWKS URI of the app<input name="jwksUri" placeholder="https://ams.example.com/.well-known/jwks.json"></label>
+  <label class="wide pk" hidden>or public JWKS (JSON)<textarea name="jwks" rows="2" placeholder='{"keys":[...]}'></textarea></label>
+ </div>
+ <fieldset><legend>Trusted handoff (optional)</legend>
+  <label class="inline"><input type="checkbox" name="outbound"> may start handoffs</label>
+  <label class="inline"><input type="checkbox" name="inbound"> may receive handoffs</label>
+  <div class="fgrid">
+   <label class="wide">Handoff callback URI<input name="handoffCallbackUri" placeholder="https://ams.example.com/auth/core/handoff"></label>
+   <label class="wide">Allowed paths <span class="muted">(comma separated, "*" = one segment)</span><input name="patterns" placeholder="/dashboard, /events/*, /events/*/details"></label>
+  </div>
+ </fieldset>
+ <div class="btns"><button class="btn" type="submit" id="regbtn">Register client</button><button class="btn light" type="button" id="testurls">Use console test URLs</button><button class="btn light" type="reset">Clear</button></div>
+</form>
+<div id="regresult"></div>
+</div>
+<h3 style="margin:16px 0 6px;font-size:15px">Registered clients</h3>
+<table><thead><tr><th>Client</th><th>Realm</th><th>Auth</th><th>Status</th><th>Redirect / logout URIs</th><th>Handoff</th><th>Usable</th><th>Actions</th></tr></thead><tbody id="clientrows"></tbody></table>
+</section>
 <section class="card"><h2>Your browser’s cookies (set by Core on localhost:4000)</h2><table><thead><tr><th>Cookie</th><th>Value</th><th>What it is</th><th>Core session behind it</th></tr></thead><tbody id="cookies"></tbody></table>
 <p class="muted" style="font-size:12.5px;margin:8px 2px 0">Signing in to one ADMIN app sets <b>miqaat-admin-sso</b>; every other ADMIN app is then signed in without a password (SSO). MUMIN has its own cookie, so ADMIN never signs you in to MUMIN. The cookies are HttpOnly (page scripts cannot read them) and hold only a random secret - Core stores just its SHA-256. The console can list them only because all localhost ports share cookies in development.</p></section>
 <section class="grid2">
@@ -673,13 +1025,90 @@ async function load(){
  document.getElementById('logout').innerHTML=d.logout.map(logoutRow).join('')||'<tr><td colspan="8" class="muted">No logout yet - use a Logout button</td></tr>';
  document.getElementById('audit').innerHTML=d.audit.map(a=>'<tr><td>'+time(a.created_at)+'</td><td class="'+(a.outcome==='FAILURE'?'no':a.outcome==='SUCCESS'?'yes':'')+'">'+esc(a.event_type)+'</td><td class="mono">'+esc(a.its_id||'')+'</td><td class="mono">'+esc(a.client_id||'')+'</td><td class="mono muted">'+esc(a.metadata?JSON.stringify(a.metadata):'')+'</td></tr>').join('');
 }
-scen();load();setInterval(load,3000);
+// ---- client registration --------------------------------------------------------------------
+let TRY='';let TRYSECRETS=[];let formDefaults=false;
+const splitLines=(v)=>String(v||'').split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);
+const splitComma=(v)=>String(v||'').split(',').map(s=>s.trim()).filter(Boolean);
+async function api(path,body){
+ const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json','x-test-console':'1'},body:JSON.stringify(body||{})});
+ const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||('HTTP '+r.status));return d;
+}
+function basicHeader(id,secret){return 'Basic '+btoa(encodeURIComponent(id)+':'+encodeURIComponent(secret));}
+function secretBox(title,clientId,secret,warnings,canTry){
+ let h='<div class="box ok"><b>'+esc(title)+'</b>';
+ if(secret){h+='<div style="margin-top:8px">client_secret for <code>'+esc(clientId)+'</code> - <b>shown once</b>, store it in the app’s secret store:</div>'
+  +'<div class="secret" id="newsecret">'+esc(secret)+'</div><button class="copy" type="button" onclick="navigator.clipboard.writeText(document.getElementById(\\'newsecret\\').textContent)">copy secret</button>'
+  +'<div style="margin-top:10px">The app authenticates at <code>POST /token</code> with:</div><div class="secret">Authorization: '+esc(basicHeader(clientId,secret))+'</div>';}
+ if(warnings&&warnings.length)h+='<ul>'+warnings.map(w=>'<li class="warn">'+esc(w)+'</li>').join('')+'</ul>';
+ if(canTry)h+='<div class="btns"><a class="btn" href="/try?client_id='+encodeURIComponent(clientId)+'">Open test app</a></div>';
+ return h+'</div>';
+}
+function clientRow(c){
+ const canTry=TRYSECRETS.includes(c.clientId)&&c.redirectUris.includes(TRY);
+ const uris=c.redirectUris.map(u=>'<div class="mono">'+esc(u)+'</div>').join('')+c.postLogoutUris.map(u=>'<div class="mono muted">logout → '+esc(u)+'</div>').join('')+(c.backchannelLogoutUri?'<div class="mono muted">back-channel → '+esc(c.backchannelLogoutUri)+'</div>':'');
+ const ho=c.handoff.inbound||c.handoff.outbound?((c.handoff.outbound?'out ':'')+(c.handoff.inbound?'in':'')+'<div class="mono muted">'+esc(c.handoff.patterns.join(', '))+'</div>'):'<span class="muted">off</span>';
+ const act=[];
+ if(canTry)act.push('<a class="copy" href="/try?client_id='+encodeURIComponent(c.clientId)+'">Open test app</a>');
+ act.push('<button class="copy" onclick="rotateSecret(\\''+esc(c.clientId)+'\\')">New secret</button>');
+ if(c.status==='ACTIVE')act.push('<button class="copy" onclick="setStatus(\\''+esc(c.clientId)+'\\',\\'SUSPENDED\\')">Suspend</button>');
+ else act.push('<button class="copy" onclick="setStatus(\\''+esc(c.clientId)+'\\',\\'ACTIVE\\')">Activate</button>');
+ return '<tr><td><b class="mono">'+esc(c.clientId)+'</b><div class="muted">'+esc(c.name)+' · '+esc(c.environment)+(c.defaultAcr?' · '+esc(c.defaultAcr.replace('urn:miqaat:','')):'')+'</div></td>'
+  +'<td>'+(c.realm?'<span class="realm '+esc(c.realm)+'">'+esc(c.realm)+'</span>':'<span class="no">none</span>')+'</td>'
+  +'<td class="mono">'+esc(c.method)+'</td><td class="'+(c.status==='ACTIVE'?'yes':'no')+'">'+esc(c.status)+'</td><td>'+uris+'</td><td>'+ho+'</td>'
+  +'<td class="'+(c.usable?'yes':'no')+'">'+(c.usable?'yes':esc(c.problems.join(', ')))+'</td><td><div class="actions">'+act.join('')+'</div></td></tr>';
+}
+let TRYLOGGEDOUT='';let TRYBASE='';
+function fillDefaults(){const f=document.getElementById('regform');f.redirectUris.value=TRY;f.postLogoutUris.value=TRYLOGGEDOUT;}
+function fillTestUrls(){const f=document.getElementById('regform');const id=f.clientId.value.trim();
+ if(!id){f.clientId.focus();document.getElementById('regresult').innerHTML='<div class="box bad">Enter the client ID first - the test URLs contain it</div>';return;}
+ f.redirectUris.value=TRY;f.postLogoutUris.value=TRYLOGGEDOUT;f.backchannelLogoutUri.value=TRYBASE+'/backchannel/'+encodeURIComponent(id);
+ f.handoffCallbackUri.value=TRYBASE+'/handoff/'+encodeURIComponent(id);if(!f.patterns.value)f.patterns.value='/dashboard, /events/*, /events/*/details';f.inbound.checked=true;f.outbound.checked=true;}
+async function loadClients(){
+ const d=await fetch('/api/clients').then(r=>r.json());TRY=d.tryRedirect;TRYLOGGEDOUT=d.tryLoggedOut;TRYBASE=d.tryBase;TRYSECRETS=d.trySecrets;
+ document.getElementById('tryuri').textContent=TRY;
+ if(!formDefaults){fillDefaults();formDefaults=true;}
+ document.getElementById('clientrows').innerHTML=d.clients.map(clientRow).join('')||'<tr><td colspan="8" class="muted">No clients</td></tr>';
+}
+async function rotateSecret(id){
+ if(!confirm('Issue a new secret for '+id+'? The current secret stops working immediately.'))return;
+ const out=document.getElementById('regresult');
+ try{const r=await api('/api/clients/rotate-secret?client_id='+encodeURIComponent(id));out.innerHTML=secretBox('New secret issued for '+id+' (was '+r.previousMethod+')',id,r.secret,[],false);}
+ catch(e){out.innerHTML='<div class="box bad">'+esc(e.message)+'</div>';}
+ loadClients();out.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+async function setStatus(id,status){
+ if(status==='SUSPENDED'&&!confirm('Suspend '+id+'? It can no longer sign members in until it is activated again.'))return;
+ try{await api('/api/clients/status?client_id='+encodeURIComponent(id)+'&status='+status);}catch(e){alert(e.message);}
+ loadClients();
+}
+document.getElementById('testurls').addEventListener('click',fillTestUrls);
+document.getElementById('authMethod').addEventListener('change',e=>{document.querySelectorAll('.pk').forEach(el=>el.hidden=e.target.value!=='private_key_jwt');});
+document.getElementById('regform').addEventListener('reset',()=>setTimeout(()=>{fillDefaults();document.querySelectorAll('.pk').forEach(el=>el.hidden=true);},0));
+document.getElementById('regform').addEventListener('submit',async e=>{
+ e.preventDefault();const f=e.target;const out=document.getElementById('regresult');const btn=document.getElementById('regbtn');
+ let jwks=null;
+ if(f.authMethod.value==='private_key_jwt'&&f.jwks.value.trim()){try{jwks=JSON.parse(f.jwks.value);}catch(x){out.innerHTML='<div class="box bad">The JWKS is not valid JSON</div>';return;}}
+ const body={clientId:f.clientId.value,name:f.elements.namedItem('name').value,realm:f.realm.value,environment:f.environment.value,businessUnit:f.businessUnit.value,defaultAcr:f.defaultAcr.value||null,
+  redirectUris:splitLines(f.redirectUris.value),postLogoutUris:splitLines(f.postLogoutUris.value),backchannelLogoutUri:f.backchannelLogoutUri.value||null,scopes:f.scopes.value,
+  authMethod:f.authMethod.value,jwksUri:f.authMethod.value==='private_key_jwt'?(f.jwksUri.value||null):null,jwks:jwks,
+  handoff:{callbackUri:f.handoffCallbackUri.value||null,inbound:f.inbound.checked,outbound:f.outbound.checked,patterns:splitComma(f.patterns.value)}};
+ btn.disabled=true;btn.textContent='Registering…';
+ try{const r=await api('/api/clients',body);
+  out.innerHTML=secretBox('Registered '+r.clientId+' (realm '+r.realm+', '+r.method+')',r.clientId,r.secret,r.warnings,Boolean(r.secret)&&body.redirectUris.includes(TRY)&&!r.warnings.some(w=>w.includes('CLIENT_AUTH_METHODS')));
+  f.reset();
+ }catch(x){out.innerHTML='<div class="box bad">'+esc(x.message)+'</div>';}
+ finally{btn.disabled=false;btn.textContent='Register client';}
+ loadClients();
+});
+document.getElementById('regresult').innerHTML='<div class="box hint">Fill in the form and press <b>Register client</b>. The secret appears here once; it is never shown again (use "New secret" to rotate it).</div>';
+scen();load();loadClients();setInterval(load,3000);setInterval(loadClients,10000);
 </script></body></html>`;
 
 // ---- start -------------------------------------------------------------------------------------
 
 async function main() {
   await db.query('SELECT 1');
+  await AppDataSource.initialize();
   await loadSecrets();
   const wrap = (fn: (req: IncomingMessage, res: ServerResponse) => Promise<void>) => (req: IncomingMessage, res: ServerResponse) =>
     fn(req, res).catch((e: unknown) => {
