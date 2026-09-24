@@ -1,0 +1,88 @@
+{
+  "name": "oidc-mfa-auth",
+  "version": "0.1.0",
+  "description": "Miqaat Core authentication - oidc-provider + SSR login + MFA (Email/SMS OTP, TOTP) on NestJS + Fastify",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "nest build",
+    "start": "node dist/main.js",
+    "start:dev": "nest start --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "jest",
+    "migration:run": "typeorm-ts-node-commonjs migration:run -d src/database/data-source.ts",
+    "migration:revert": "typeorm-ts-node-commonjs migration:revert -d src/database/data-source.ts",
+    "migration:show": "typeorm-ts-node-commonjs migration:show -d src/database/data-source.ts",
+    "client:register": "ts-node -r tsconfig-paths/register scripts/client-register.ts",
+    "mfa:add-factor": "ts-node -r tsconfig-paths/register scripts/mfa-add-factor.ts",
+    "e2e:flow": "ts-node -r tsconfig-paths/register scripts/e2e-flow.ts",
+    "keys": "ts-node -r tsconfig-paths/register scripts/keys.ts",
+    "password": "ts-node -r tsconfig-paths/register scripts/password.ts",
+    "test:e2e": "ts-node -r tsconfig-paths/register scripts/e2e-suite.ts",
+    "migration:run:prod": "node node_modules/typeorm/cli.js migration:run -d dist/database/data-source.js",
+    "migration:show:prod": "node node_modules/typeorm/cli.js migration:show -d dist/database/data-source.js",
+    "docker:dev": "docker compose -f docker-compose.dev.yml up --build",
+    "docker:prod": "docker compose -f docker-compose.prod.yml up -d --build",
+    "demo:client": "ts-node -r tsconfig-paths/register scripts/demo-client.ts",
+    "console": "ts-node -r tsconfig-paths/register scripts/test-console.ts",
+    "test:browser": "ts-node -r tsconfig-paths/register scripts/browser-check.ts",
+    "client:add-uri": "ts-node -r tsconfig-paths/register scripts/client-add-uri.ts",
+    "client:handoff": "ts-node -r tsconfig-paths/register scripts/client-handoff.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-kms": "^3.1139.0",
+    "@fastify/cookie": "^11.1.2",
+    "@fastify/helmet": "^13.1.1",
+    "@fastify/static": "^10.1.4",
+    "@nestjs/common": "^11.2.6",
+    "@nestjs/core": "^11.2.6",
+    "@nestjs/platform-fastify": "^11.2.6",
+    "@nestjs/typeorm": "^11.0.3",
+    "fastify": "^5.11.3",
+    "iconv-lite": "^0.7.3",
+    "ioredis": "^5.11.1",
+    "jose": "^6.2.12",
+    "nodemailer": "^10.0.10",
+    "oidc-provider": "^9.12.2",
+    "pg": "^8.23.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "typeorm": "^0.3.31",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^11.0.24",
+    "@nestjs/testing": "^11.2.6",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^22.20.4",
+    "@types/nodemailer": "^8.0.2",
+    "@types/oidc-provider": "^9.12.1",
+    "@types/pg": "^8.23.1",
+    "jest": "^30.5.2",
+    "playwright-core": "^1.63.0",
+    "ts-jest": "^29.4.13",
+    "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "~5.8"
+  },
+  "jest": {
+    "moduleFileExtensions": [
+      "js",
+      "json",
+      "ts"
+    ],
+    "rootDir": ".",
+    "roots": [
+      "<rootDir>/src",
+      "<rootDir>/test"
+    ],
+    "testRegex": ".*\\.spec\\.ts$",
+    "transform": {
+      "^.+\\.ts$": "ts-jest"
+    },
+    "testEnvironment": "node"
+  }
+}

@@ -1,0 +1,366 @@
+/* Miqaat Core sign-in - modelled on the RMS Mumin login (teal brand panel, gold accents, cream form). */
+:root {
+  --brand-top: #10232a;
+  --brand-mid: #17393d;
+  --brand-bottom: #215f60;
+  --gold: #d2a55a;
+  --gold-soft: #c9a063;
+  --cream: #fbf9f5;
+  --ink: #1d2b33;
+  --muted: #5b6770;
+  --teal: #1c5a5c;
+  --teal-2: #2a7272;
+  --label: #8a6a45;
+  --line: #e4ded3;
+  --focus: rgba(28, 90, 92, 0.18);
+  --error-bg: #fdf1ef;
+  --error-ink: #9b2c1f;
+  --error-line: #f1c9c2;
+  --info-bg: #eef6f5;
+  --info-ink: #1c5a5c;
+  --info-line: #c9e1de;
+  --radius: 10px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--cream);
+  color: var(--ink);
+  font-family: 'Mulish', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.auth {
+  display: grid;
+  grid-template-columns: 55fr 45fr;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+/* ---- brand panel ------------------------------------------------------------------------- */
+.brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  color: var(--gold-soft);
+  background: linear-gradient(180deg, var(--brand-top) 0%, var(--brand-mid) 45%, var(--brand-bottom) 100%);
+}
+
+.brand-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.brand-logo {
+  width: 160px;
+  height: auto;
+}
+
+.brand-divider {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 28px 0 22px;
+  color: var(--gold);
+}
+
+.brand-divider span {
+  display: block;
+  width: 92px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--gold));
+}
+
+.brand-divider span:last-child {
+  background: linear-gradient(90deg, var(--gold), transparent);
+}
+
+.brand-greeting {
+  margin: 0;
+  font-family: 'Amiri', serif;
+  font-size: 46px;
+  line-height: 1.2;
+  color: #fff;
+}
+
+.brand-tagline {
+  margin: 14px 0 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--gold-soft);
+}
+
+/* ---- form panel ---------------------------------------------------------------------------- */
+.panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px 24px;
+  background: var(--cream);
+}
+
+.card {
+  width: 100%;
+  max-width: 420px;
+  margin: auto 0;
+}
+
+.panel-footer {
+  margin-top: 32px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.title {
+  margin: 0;
+  text-align: center;
+  font-family: 'Marcellus', serif;
+  font-weight: 400;
+  font-size: 30px;
+  color: var(--teal);
+}
+
+.subtitle {
+  margin: 10px 0 28px;
+  text-align: center;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.subtitle strong {
+  color: var(--ink);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+}
+
+.label {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--label);
+}
+
+.input {
+  width: 100%;
+  height: 48px;
+  margin-bottom: 20px;
+  padding: 0 16px;
+  font: inherit;
+  font-size: 16px;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.input::placeholder {
+  color: #8f979d;
+}
+
+.input:focus {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 4px var(--focus);
+}
+
+.input-code {
+  text-align: center;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 0.5em;
+  padding-left: calc(16px + 0.5em);
+}
+
+.input-wrap {
+  position: relative;
+}
+
+.input-wrap .input {
+  padding-right: 52px;
+}
+
+.reveal {
+  position: absolute;
+  top: 0;
+  right: 4px;
+  width: 44px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: var(--muted);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.reveal[aria-pressed='true'] {
+  color: var(--teal);
+}
+
+.row-end {
+  display: flex;
+  justify-content: flex-end;
+  margin: -6px 0 24px;
+}
+
+.link,
+.link-button {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--teal);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.button {
+  height: 48px;
+  margin-top: 8px;
+  font: inherit;
+  font-size: 16px;
+  font-weight: 800;
+  color: #fff;
+  background: linear-gradient(90deg, var(--teal), var(--teal-2));
+  border: 0;
+  border-radius: 999px;
+  box-shadow: 0 8px 20px rgba(28, 90, 92, 0.22);
+  cursor: pointer;
+  transition: filter 0.15s, opacity 0.15s;
+}
+
+.button:hover {
+  filter: brightness(1.06);
+}
+
+.button:disabled {
+  cursor: not-allowed;
+  background: linear-gradient(90deg, #8eaaa8, #95a39f);
+  box-shadow: none;
+}
+
+.alert {
+  margin: 0 0 20px;
+  padding: 12px 14px;
+  font-size: 14px;
+  line-height: 1.45;
+  border: 1px solid;
+  border-radius: var(--radius);
+}
+
+.alert-error {
+  color: var(--error-ink);
+  background: var(--error-bg);
+  border-color: var(--error-line);
+}
+
+.alert-info {
+  color: var(--info-ink);
+  background: var(--info-bg);
+  border-color: var(--info-line);
+}
+
+.muted {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.inline-form {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 18px 0 0;
+}
+
+.alternatives {
+  margin-top: 24px;
+  padding-top: 18px;
+  text-align: center;
+  border-top: 1px solid var(--line);
+}
+
+.alternatives .inline-form {
+  margin-top: 10px;
+}
+
+.cancel-form {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 28px;
+  text-align: center;
+}
+
+/* ---- phone layout: brand header on top, form card overlapping it --------------------------- */
+@media (max-width: 800px) {
+  .auth {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .brand {
+    padding: 36px 16px 64px;
+  }
+
+  .brand-logo {
+    width: 120px;
+  }
+
+  .brand-divider {
+    margin: 18px 0 14px;
+  }
+
+  .brand-greeting {
+    font-size: 34px;
+  }
+
+  .panel {
+    flex: 1;
+    justify-content: flex-start;
+    margin-top: -28px;
+    padding: 32px 16px 20px;
+    border-radius: 28px 0 0 0;
+  }
+
+  .card {
+    margin: 0;
+  }
+
+  .panel-footer {
+    margin-top: auto;
+    padding-top: 32px;
+  }
+
+  .title {
+    font-size: 26px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}

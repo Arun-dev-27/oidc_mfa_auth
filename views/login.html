@@ -1,0 +1,42 @@
+<h1 class="title">Login to Continue</h1>
+<p class="subtitle">Use your ITS credentials to access the portal</p>
+
+{{#error}}<div class="alert alert-error" role="alert">{{error}}</div>{{/error}}
+{{#info}}<div class="alert alert-info" role="status">{{info}}</div>{{/info}}
+
+<form method="post" action="{{formBase}}/login" class="form" autocomplete="on" data-auth-form>
+  <input type="hidden" name="csrf" value="{{csrf}}" />
+
+  <label for="its_id" class="label">ITS ID</label>
+  <input
+    id="its_id"
+    name="its_id"
+    class="input"
+    type="text"
+    inputmode="numeric"
+    autocomplete="username"
+    maxlength="10"
+    placeholder="Enter your 8-digit ITS ID"
+    value="{{itsId}}"
+    required
+    autofocus
+  />
+
+  <label for="password" class="label">Password</label>
+  <div class="input-wrap">
+    <input id="password" name="password" class="input" type="password" autocomplete="current-password" placeholder="Enter your password" required />
+    <button type="button" class="reveal" data-reveal="password" aria-label="Show password" aria-pressed="false">
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M1.5 12S5.5 4.5 12 4.5 22.5 12 22.5 12 18.5 19.5 12 19.5 1.5 12 1.5 12Z" fill="none" stroke="currentColor" stroke-width="1.6" /><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6" /></svg>
+    </button>
+  </div>
+
+  {{#forgotUrl}}<div class="row-end"><a class="link" href="{{forgotUrl}}">Forgot password?</a></div>{{/forgotUrl}}
+
+  <button type="submit" class="button" data-submit>Login</button>
+</form>
+
+<form method="post" action="{{formBase}}/abort" class="cancel-form">
+  <input type="hidden" name="csrf" value="{{csrf}}" />
+  <p class="muted">Signing in to <strong>{{clientName}}</strong> · {{realmLabel}}</p>
+  <button type="submit" class="link-button">Cancel</button>
+</form>

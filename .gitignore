@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.keys/
+.outbox/
+*.tsbuildinfo
+coverage/
+.e2e*
+.env.production

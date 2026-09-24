@@ -1,0 +1,13 @@
+node_modules
+dist
+coverage
+.git
+.env
+.env.*
+!.env.example
+!.env.production.example
+.keys
+.outbox
+.e2e
+.e2e*
+*.tsbuildinfo

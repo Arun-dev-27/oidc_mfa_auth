@@ -1,0 +1,9 @@
+<h1 class="title">Opening {{targetName}}…</h1>
+<p class="subtitle">You are signed in - taking you to the requested page.</p>
+
+<!-- Handoff spec §9: the one-time signed assertion is delivered by an auto-submitted POST,
+     never in a URL. auth.js submits it immediately; the button covers browsers without JavaScript. -->
+<form method="post" action="{{callback}}" class="form" data-autosubmit>
+  <input type="hidden" name="assertion" value="{{assertion}}" />
+  <button type="submit" class="button">Continue to {{targetName}}</button>
+</form>

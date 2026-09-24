@@ -1,0 +1,60 @@
+# -----------------------------------------------------------------------------------------------
+# PRODUCTION - oidc_mfa_auth.
+#
+#   cp .env.production.example .env.production        # fill in real values (never commit it)
+#   docker compose -f docker-compose.prod.yml run --rm migrate     # schema migration (idempotent)
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Put an HTTPS reverse proxy / load balancer in front (ISSUER must be https) and set TRUST_PROXY
+# to the number of proxy hops. The service refuses to start with unsafe production settings
+# (http issuer, insecure cookies, outbox transports, signing keys outside KMS, custom AWS endpoint).
+# Signing keys live in AWS KMS: give the container an IAM role / credentials allowed to
+# kms:Sign + kms:GetPublicKey on the signing keys.
+# -----------------------------------------------------------------------------------------------
+name: oidc-mfa-auth
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.prod
+      target: runtime
+    image: ${IMAGE:-oidc-mfa-auth:latest}
+    env_file: ${ENV_FILE:-.env.production}
+    environment:
+      NODE_ENV: production
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-4000}:4000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # One-shot schema migration with the compiled migration (no TypeScript in the image).
+  migrate:
+    image: ${IMAGE:-oidc-mfa-auth:latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.prod
+      target: runtime
+    env_file: ${ENV_FILE:-.env.production}
+    environment:
+      NODE_ENV: production
+    command: ["node", "node_modules/typeorm/cli.js", "migration:run", "-d", "dist/database/data-source.js"]
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    profiles: ["tools"]

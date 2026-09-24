@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="112" viewBox="0 0 160 112" role="img" aria-label="Miqaat">
+  <!-- Placeholder mark. Replace this file with the official Miqaat logo artwork. -->
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f0d08a"/>
+      <stop offset="1" stop-color="#b8863e"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke="url(#g)" stroke-width="2">
+    <path d="M80 8 C62 8 50 22 50 40 C50 62 80 78 80 78 C80 78 110 62 110 40 C110 22 98 8 80 8 Z"/>
+    <path d="M80 20 C70 20 63 28 63 38 C63 52 80 62 80 62 C80 62 97 52 97 38 C97 28 90 20 80 20 Z"/>
+  </g>
+  <circle cx="80" cy="38" r="6" fill="url(#g)"/>
+  <text x="80" y="104" text-anchor="middle" font-family="Marcellus, Georgia, serif" font-size="26" letter-spacing="3" fill="url(#g)">MIQAAT</text>
+</svg>

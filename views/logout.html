@@ -1,0 +1,14 @@
+<h1 class="title">Sign out?</h1>
+<p class="subtitle">You will be signed out of <strong>{{clientName}}</strong> and of every other <strong>{{realmLabel}}</strong> application you are signed in to.</p>
+
+<form method="post" action="/logout/confirm" class="form" data-auth-form>
+  <input type="hidden" name="csrf" value="{{csrf}}" />
+  <input type="hidden" name="client_id" value="{{clientId}}" />
+  <input type="hidden" name="post_logout_redirect_uri" value="{{redirectUri}}" />
+  <input type="hidden" name="state" value="{{state}}" />
+  <button type="submit" class="button">Sign out</button>
+</form>
+
+{{#cancelUrl}}
+<div class="cancel-form"><a class="link" href="{{cancelUrl}}">Stay signed in</a></div>
+{{/cancelUrl}}

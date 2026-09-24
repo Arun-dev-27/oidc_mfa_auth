@@ -1,0 +1,52 @@
+<h1 class="title">Verify it’s you</h1>
+{{#isOtp}}<p class="subtitle">Enter the 6-digit code sent by {{channelLabel}} to <strong>{{destination}}</strong></p>{{/isOtp}}
+{{#isTotp}}<p class="subtitle">Enter the 6-digit code from your authenticator app</p>{{/isTotp}}
+
+{{#error}}<div class="alert alert-error" role="alert">{{error}}</div>{{/error}}
+{{#info}}<div class="alert alert-info" role="status">{{info}}</div>{{/info}}
+
+{{#canVerify}}
+<form method="post" action="{{formBase}}/mfa" class="form" autocomplete="off" data-auth-form>
+  <input type="hidden" name="csrf" value="{{csrf}}" />
+  <input type="hidden" name="challenge_id" value="{{challengeId}}" />
+  <input type="hidden" name="method" value="{{method}}" />
+
+  <label for="code" class="label">Verification code</label>
+  <input
+    id="code"
+    name="code"
+    class="input input-code"
+    type="text"
+    inputmode="numeric"
+    autocomplete="one-time-code"
+    pattern="[0-9]{6}"
+    maxlength="6"
+    placeholder="••••••"
+    required
+    autofocus
+  />
+
+  <button type="submit" class="button" data-submit>Verify</button>
+</form>
+{{/canVerify}}
+
+{{#isOtp}}
+<form method="post" action="{{formBase}}/mfa/resend" class="inline-form resend">
+  <input type="hidden" name="csrf" value="{{csrf}}" />
+  <input type="hidden" name="method" value="{{method}}" />
+  <span class="muted">Didn’t get it?</span>
+  <button type="submit" class="link-button">Send a new code</button>
+</form>
+{{/isOtp}}
+
+{{#hasAlternatives}}
+<div class="alternatives">
+  <p class="muted">Other ways to verify</p>
+  {{{alternatives}}}
+</div>
+{{/hasAlternatives}}
+
+<form method="post" action="{{formBase}}/abort" class="cancel-form">
+  <input type="hidden" name="csrf" value="{{csrf}}" />
+  <button type="submit" class="link-button">Cancel sign-in</button>
+</form>

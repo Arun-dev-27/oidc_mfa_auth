@@ -1,0 +1,60 @@
+# -----------------------------------------------------------------------------------------------
+# DEVELOPMENT - oidc_mfa_auth with hot reload against your local databases.
+#
+#   docker compose -f docker-compose.dev.yml up --build            # start (http://localhost:4000)
+#   docker compose -f docker-compose.dev.yml run --rm migrate      # apply the schema migration
+#   docker compose -f docker-compose.dev.yml exec app npm run keys -- generate
+#   docker compose -f docker-compose.dev.yml exec app npm run client:register -- ...
+#   docker compose -f docker-compose.dev.yml down
+#
+# Reads .env (same file as running without Docker). "localhost" inside a container is the
+# container itself, so the database / Redis / LocalStack hosts are pointed at the Docker host.
+# Keys (.keys) and the Email/SMS outbox (.outbox) are shared with the host folder.
+# -----------------------------------------------------------------------------------------------
+name: oidc-mfa-auth-dev
+
+x-dev-env: &dev-env
+  NODE_ENV: development
+  DB_HOST: ${DOCKER_DB_HOST:-host.docker.internal}
+  REDIS_URL: ${DOCKER_REDIS_URL:-redis://host.docker.internal:6393/2}
+  AWS_ENDPOINT_URL: ${DOCKER_AWS_ENDPOINT_URL:-}
+  EMAIL_TRANSPORT: outbox
+  SMS_TRANSPORT: outbox
+  COOKIE_SECURE: "false"
+  SSO_COOKIE_ADMIN: miqaat-admin-sso
+  SSO_COOKIE_MUMIN: miqaat-mumin-sso
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    image: oidc-mfa-auth:dev
+    env_file: .env
+    environment: *dev-env
+    ports:
+      - "${PORT:-4000}:4000"
+    volumes:
+      - ./src:/app/src
+      - ./views:/app/views
+      - ./public:/app/public
+      - ./scripts:/app/scripts
+      - ./.keys:/app/.keys
+      - ./.outbox:/app/.outbox
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    init: true
+    restart: unless-stopped
+
+  # One-shot: npm run migration:run (TypeScript migration via ts-node).
+  migrate:
+    image: oidc-mfa-auth:dev
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    env_file: .env
+    environment: *dev-env
+    command: ["npm", "run", "migration:run"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    profiles: ["tools"]
