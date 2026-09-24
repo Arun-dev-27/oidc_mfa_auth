@@ -366,6 +366,12 @@ async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
 
 /** Target-local rules: what this demo app lets a handoff open, and who may open it. */
 const TARGET_PATHS = ['/dashboard', '/events/*', '/events/*/details', '/bookings/*', '/admin/*'];
+
+/** The target re-checks the path with its own rules: the allowlist registered for it in Core (fallback: the demo list). */
+async function targetPaths(clientId: string): Promise<string[]> {
+  const rows = (await db.query('SELECT path_pattern FROM auth_client_handoff_paths WHERE client_id = $1 AND enabled', [clientId])).rows as { path_pattern: string }[];
+  return rows.length ? rows.map((r) => r.path_pattern) : TARGET_PATHS;
+}
 const handoffJti = new Map<string, number>();
 
 /** Handoff spec §14, in order. Any failure: no local session, no redirect to the requested path. */
@@ -411,7 +417,7 @@ async function verifyHandoff(app: Pick<App, 'clientId' | 'realm'>, assertion: st
   handoffJti.set(String(claims.jti), now);
   // The target validates the signed path again with its own rules.
   const path = normalizeRelativePath(claims.requested_path);
-  if (!path || path !== claims.requested_path || !isAllowedPath(path, TARGET_PATHS)) return { ok: false, code: 'HANDOFF_PATH_INVALID' };
+  if (!path || path !== claims.requested_path || !isAllowedPath(path, await targetPaths(app.clientId))) return { ok: false, code: 'HANDOFF_PATH_INVALID' };
   // Target-local authorization (demo policy): nobody has the admin role in these demo apps.
   const denied = path.startsWith('/admin/');
   return { ok: true, claims, kid: header.kid, denied };
@@ -1044,7 +1050,7 @@ function appCard(a){
 }
 let APPS=[];
 function handoffForm(a){const others=APPS.filter(o=>o.key!==a.key);
- return '<form class="handoff" method="get" action="'+a.base+'/handoff"><span class="muted">Open another app via handoff:</span> <select name="target">'+others.map(o=>'<option value="'+o.key+'">'+esc(o.label)+' ('+esc(o.realm)+')</option>').join('')+'</select> <select name="path"><option>/events/123</option><option>/events/123/details</option><option>/bookings/ABC</option><option>/dashboard</option><option>/admin/users</option></select> <button class="btn light" type="submit">Open via handoff</button></form>';}
+ return '<form class="handoff" method="get" action="'+a.base+'/handoff"><span class="muted">Open another app via handoff:</span> <select name="target">'+others.map(o=>'<option value="'+o.key+'">'+esc(o.label)+' ('+esc(o.realm)+')</option>').join('')+'</select> <select name="path"><option>/events/123</option><option>/events/123/details</option><option>/bookings/ABC</option><option>/bookings/ABC/summary</option><option>/dashboard</option><option>/admin/users</option></select> <button class="btn light" type="submit">Open via handoff</button></form>';}
 async function setDown(k,down){await fetch('/api/backchannel?app='+k+'&down='+(down?1:0));load();}
 function cookieRow(c){const s=c.session;let sess='';
  if(c.realm){sess=!c.preview?'<span class="muted">—</span>':!s?'<span class="no">no matching session (already revoked or unknown)</span>':'<span class="'+(s.status==='ACTIVE'?'yes':'no')+'">'+esc(s.status)+'</span> · sid <span class="mono">'+short(s.sid)+'</span> · ITS '+esc(s.its_id)+' · AAL '+esc(s.aal)+(s.mfa_method?' ('+esc(s.mfa_method)+')':'')+'<br><span class="muted">apps: '+esc(s.apps||'—')+' · idle expiry '+time(s.expires_at)+'</span>';}
