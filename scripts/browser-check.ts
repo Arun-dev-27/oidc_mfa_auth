@@ -426,6 +426,31 @@ async function main() {
     const crossSite = await fetch(`${CONSOLE}/api/clients`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-test-console': '1', origin: 'https://evil.example' }, body: '{}' });
     check('Registration API refuses requests from another origin (403)', crossSite.status === 403);
     await deleteUiClient();
+
+    // ---- testing static OTP (only when the running service has MFA_STATIC_OTP) ---------------
+    const fixed = process.env.MFA_STATIC_OTP?.trim();
+    if (fixed) {
+      console.log(`\n=== Real browser: static test OTP (MFA_STATIC_OTP=${fixed})`);
+      for (const [itsId, label] of [
+        ['10110101', 'Email OTP member'],
+        ['10110104', 'SMS OTP member'],
+        ['10110103', 'TOTP member'],
+        ['10110102', 'member without any MFA method'],
+      ] as const) {
+        await fetch(`${CONSOLE}/api/clear?app=rms-admin`);
+        const sp = await (await browser.newContext()).newPage();
+        await sp.goto(`${CONSOLE}/`);
+        await sp.locator('#rms-admin').getByRole('link', { name: 'Sign in + MFA (AAL2)', exact: true }).click();
+        await sp.fill('#its_id', itsId);
+        await sp.fill('#password', pw(itsId));
+        await Promise.all([sp.waitForSelector('#code', { timeout: 15_000 }), sp.click('button[data-submit]')]);
+        await sp.fill('#code', fixed);
+        await Promise.all([sp.waitForURL((u) => u.toString().startsWith(CONSOLE), { timeout: 15_000 }), sp.click('button[data-submit]')]);
+        const claims = (await state()).apps.find((a) => a.key === 'rms-admin')!.session?.claims;
+        check(`${label} (${itsId}): typing ${fixed} completes MFA -> aal:2`, claims?.sub === itsId && claims?.acr === 'urn:miqaat:aal:2', JSON.stringify(claims?.acr));
+        await sp.context().close();
+      }
+    } else console.log('\n(static test OTP checks skipped: MFA_STATIC_OTP is not set)');
   } finally {
     await browser.close();
   }

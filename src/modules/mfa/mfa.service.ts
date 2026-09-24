@@ -29,7 +29,7 @@ export type StartOtpResult =
   | { ok: false; code: 'RESEND_COOLDOWN'; retryAfterSeconds: number };
 
 export type VerifyResult =
-  | { ok: true; method: MfaMethod }
+  | { ok: true; method: MfaMethod; /** accepted through MFA_STATIC_OTP (testing) */ staticOtp?: boolean }
   | { ok: false; code: 'INVALID_CODE'; remaining: number }
   | { ok: false; code: 'CODE_EXPIRED' | 'TOO_MANY_ATTEMPTS' | 'METHOD_UNAVAILABLE' };
 
@@ -53,6 +53,9 @@ export class MfaService {
     private readonly rateLimit: RateLimitService,
   ) {
     this.dataKey = toKey32(config.env.DATA_ENCRYPTION_KEY);
+    if (config.env.MFA_STATIC_OTP) {
+      this.logger.warn('MFA_STATIC_OTP is set: a fixed test code is accepted for every member and method (testing only)');
+    }
   }
 
   /** AAL2 needed? The BU asks for it (acr_values / client default), or platform / member policy forces it. */
@@ -101,6 +104,11 @@ export class MfaService {
       options.push({ method: 'EMAIL_OTP', label: 'Email', masked: maskEmail(member.email), factorId: null, destination: member.email, isDefault: false });
     }
 
+    // Testing (MFA_STATIC_OTP): a member without any method still gets a step only the static code completes.
+    if (!options.length && this.config.env.MFA_STATIC_OTP) {
+      options.push({ method: 'EMAIL_OTP', label: 'Test code', masked: 'test mode (use the static test code)', factorId: null, destination: null, isDefault: true });
+    }
+
     const preferred = options.find((o) => o.isDefault) ?? options.find((o) => o.method === this.config.env.MFA_DEFAULT_METHOD) ?? options[0];
     return preferred ? [preferred, ...options.filter((o) => o !== preferred)] : [];
   }
@@ -108,17 +116,21 @@ export class MfaService {
   /** Creates a one-time code, stores only its HMAC, and sends it through the channel adapter. */
   async startOtp(member: Member, session: RealmSession, uid: string, option: MfaOption, opts: { resend: boolean }): Promise<StartOtpResult> {
     const env = this.config.env;
-    if (option.method === 'TOTP' || !option.destination) return { ok: false, code: 'CHANNEL_UNAVAILABLE' };
+    const testOnly = Boolean(env.MFA_STATIC_OTP) && option.destination === null;
+    if (option.method === 'TOTP' || (!option.destination && !testOnly)) return { ok: false, code: 'CHANNEL_UNAVAILABLE' };
     const channel = CHANNEL[option.method];
     const adapter = this.adapters.get(channel);
-    if (!adapter) return { ok: false, code: 'CHANNEL_UNAVAILABLE' };
+    if (!adapter && !testOnly) return { ok: false, code: 'CHANNEL_UNAVAILABLE' };
 
     if (opts.resend) {
       const wait = await this.rateLimit.cooldown('otp-resend', `${session.sid}:${uid}`, env.OTP_RESEND_COOLDOWN_SECONDS);
       if (wait > 0) return { ok: false, code: 'RESEND_COOLDOWN', retryAfterSeconds: wait };
     }
-    const sentLastHour = await this.challenges.countSentSince(member.itsId, new Date(Date.now() - 3_600_000));
-    if (sentLastHour >= env.OTP_MAX_SENDS_PER_HOUR) return { ok: false, code: 'TOO_MANY_CODES' };
+    // The hourly cap is not applied while testing with MFA_STATIC_OTP.
+    if (!env.MFA_STATIC_OTP) {
+      const sentLastHour = await this.challenges.countSentSince(member.itsId, new Date(Date.now() - 3_600_000));
+      if (sentLastHour >= env.OTP_MAX_SENDS_PER_HOUR) return { ok: false, code: 'TOO_MANY_CODES' };
+    }
 
     const code = randomDigits(env.OTP_LENGTH);
     const challenge = await this.challenges.create({
@@ -133,6 +145,7 @@ export class MfaService {
       expiresAt: new Date(Date.now() + env.OTP_TTL_SECONDS * 1000),
     });
 
+    if (testOnly || !adapter || !option.destination) return { ok: true, challengeId: challenge.id, masked: option.masked, channel };
     try {
       const result = await adapter.send({ to: option.destination, code, ttlMinutes: Math.ceil(env.OTP_TTL_SECONDS / 60), itsId: member.itsId });
       await this.challenges.setProviderMessageId(challenge.id, result.providerMessageId);
@@ -181,12 +194,14 @@ export class MfaService {
     if (attempt === null) {
       return challenge.attemptCount >= challenge.maxAttempts ? { ok: false, code: 'TOO_MANY_ATTEMPTS' } : { ok: false, code: 'CODE_EXPIRED' };
     }
-    if (!safeEqual(this.codeHash(code, member.itsId, session.sid, uid), challenge.codeHash)) {
+    const real = safeEqual(this.codeHash(code, member.itsId, session.sid, uid), challenge.codeHash);
+    const staticOtp = !real && this.isStaticCode(code);
+    if (!real && !staticOtp) {
       const remaining = challenge.maxAttempts - attempt;
       return remaining > 0 ? { ok: false, code: 'INVALID_CODE', remaining } : { ok: false, code: 'TOO_MANY_ATTEMPTS' };
     }
     if (!(await this.challenges.consume(challenge.id))) return { ok: false, code: 'CODE_EXPIRED' };
-    return { ok: true, method: challenge.channel === 'EMAIL' ? 'EMAIL_OTP' : 'SMS_OTP' };
+    return { ok: true, method: challenge.channel === 'EMAIL' ? 'EMAIL_OTP' : 'SMS_OTP', ...(staticOtp ? { staticOtp } : {}) };
   }
 
   private async verifyTotpCode(member: Member, session: RealmSession, uid: string, code: string): Promise<VerifyResult> {
@@ -195,12 +210,19 @@ export class MfaService {
     if (!limit.allowed) return { ok: false, code: 'TOO_MANY_ATTEMPTS' };
     const factor = (await this.factors.findActive(member.itsId)).find((f) => f.method === 'TOTP' && f.totpSecretEnc);
     if (!factor?.totpSecretEnc) return { ok: false, code: 'METHOD_UNAVAILABLE' };
+    if (this.isStaticCode(code)) return { ok: true, method: 'TOTP', staticOtp: true };
     const secret = this.decrypt(factor.totpSecretEnc);
     const step = secret ? verifyTotp(secret, code) : null;
     if (step === null || !(await this.factors.acceptTotpStep(factor.id, step))) {
       return { ok: false, code: 'INVALID_CODE', remaining: Math.max(0, env.OTP_MAX_ATTEMPTS - 1) };
     }
     return { ok: true, method: 'TOTP' };
+  }
+
+  /** Testing only: the configured MFA_STATIC_OTP (never set in production). */
+  private isStaticCode(code: string): boolean {
+    const fixed = this.config.env.MFA_STATIC_OTP;
+    return Boolean(fixed) && safeEqual(code, fixed);
   }
 
   /** HMAC bound to the member, session and interaction: a code is useless anywhere else. */

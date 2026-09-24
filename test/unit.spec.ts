@@ -132,6 +132,14 @@ describe('configuration rules', () => {
     expect(() => parseEnv({ ...BASE_ENV, NODE_ENV: 'production' })).toThrow(/production/);
   });
 
+  it('static test OTP: off by default, digits of OTP_LENGTH, refused in production', () => {
+    expect(parseEnv({ ...BASE_ENV }).MFA_STATIC_OTP).toBe('');
+    expect(parseEnv({ ...BASE_ENV, MFA_STATIC_OTP: '123456' }).MFA_STATIC_OTP).toBe('123456');
+    expect(() => parseEnv({ ...BASE_ENV, MFA_STATIC_OTP: '12ab56' })).toThrow(/MFA_STATIC_OTP/);
+    expect(() => parseEnv({ ...BASE_ENV, MFA_STATIC_OTP: '1234' })).toThrow(/OTP_LENGTH/);
+    expect(() => parseEnv({ ...BASE_ENV, NODE_ENV: 'production', MFA_STATIC_OTP: '123456' })).toThrow(/MFA_STATIC_OTP/);
+  });
+
   it('client authentication: client_secret_basic by default, others only when listed', () => {
     expect(parseEnv({ ...BASE_ENV }).CLIENT_AUTH_METHODS).toEqual(['client_secret_basic']);
     expect(parseEnv({ ...BASE_ENV, CLIENT_AUTH_METHODS: ' client_secret_basic , private_key_jwt,client_secret_basic' }).CLIENT_AUTH_METHODS).toEqual(['client_secret_basic', 'private_key_jwt']);

@@ -137,7 +137,7 @@ export class InteractionService {
     }
 
     const upgraded = await this.sessions.upgradeToAal2(session, result.method, req, reply);
-    await this.audit.record({ eventType: 'MFA_SUCCESS', outcome: 'SUCCESS', itsId: member.itsId, sid: upgraded.sid, clientId: ctx.clientId, metadata: { method: result.method }, ...this.meta(req) });
+    await this.audit.record({ eventType: 'MFA_SUCCESS', outcome: 'SUCCESS', itsId: member.itsId, sid: upgraded.sid, clientId: ctx.clientId, metadata: { method: result.method, ...(result.staticOtp ? { staticOtp: true } : {}) }, ...this.meta(req) });
     return this.finish(req, reply, ctx, member, upgraded);
   }
 

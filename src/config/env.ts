@@ -139,6 +139,17 @@ export const envSchema = z
     OTP_MAX_SENDS_PER_HOUR: int(10, 1),
     /** HMAC key for OTP hashes (32+ chars). */
     OTP_HMAC_KEY: z.string().min(32),
+    /**
+     * TESTING ONLY. When set (e.g. 123456), this code is accepted for every member and every method -
+     * Email OTP, SMS OTP and TOTP - besides the real code; members without any method get an Email-OTP
+     * style step that only this code completes, and the hourly OTP cap is not applied.
+     * Empty = off (default). Refused in production.
+     */
+    MFA_STATIC_OTP: z
+      .string()
+      .default('')
+      .transform((v) => v.trim())
+      .refine((v) => v === '' || /^[0-9]{4,8}$/.test(v), 'MFA_STATIC_OTP: 4-8 digits (e.g. 123456) or empty'),
 
     // --- Email adapter ----------------------------------------------------------------------
     /** smtp: real mail. outbox: writes each message to OUTBOX_DIR (development only). */
@@ -180,6 +191,10 @@ export const envSchema = z
       if (env.SMS_TRANSPORT === 'outbox') ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['SMS_TRANSPORT'], message: 'outbox is for development only' });
       if (env.SIGNING_KEY_PROVIDER !== 'kms') ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['SIGNING_KEY_PROVIDER'], message: 'production signing keys must live in KMS (SIGNING_KEY_PROVIDER=kms)' });
       if (env.AWS_ENDPOINT_URL) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['AWS_ENDPOINT_URL'], message: 'must be empty in production' });
+      if (env.MFA_STATIC_OTP) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['MFA_STATIC_OTP'], message: 'a static OTP is for testing only and must be empty in production' });
+    }
+    if (env.MFA_STATIC_OTP && env.MFA_STATIC_OTP.length !== env.OTP_LENGTH) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['MFA_STATIC_OTP'], message: `must have OTP_LENGTH (${env.OTP_LENGTH}) digits` });
     }
     if (env.EMAIL_TRANSPORT === 'smtp' && !env.SMTP_HOST) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['SMTP_HOST'], message: 'required when EMAIL_TRANSPORT=smtp' });

@@ -409,6 +409,8 @@ const BASE: Record<string, string> = {
   OTP_RESEND_COOLDOWN_SECONDS: '2',
   LOGIN_ELIGIBILITY_CHECK_ENABLED: 'true',
   MFA_REQUIRED_FOR_ALL: 'false',
+  // A local .env may enable the testing static OTP; the suite switches it on only in its own profile.
+  MFA_STATIC_OTP: '',
 };
 
 let server: RunningServer | null = null;
@@ -808,6 +810,64 @@ async function main() {
   });
 
   // ------------------------------------------------------------------------------------------------
+  await profile('6b. Static test OTP (MFA_STATIC_OTP=123456)', { MFA_STATIC_OTP: '123456', OTP_MAX_SENDS_PER_HOUR: '1' }, async () => {
+    const { admin } = clients;
+    const STATIC = '123456';
+    /** Password, then the given MFA code; returns the MFA page seen and the final step. */
+    const loginWith = async (itsId: string, code: string) => {
+      const b = new Browser();
+      const { flow, step } = await start(b, admin, { acr: AAL2 });
+      const afterLogin = await submitLogin(b, step.page!, admin, itsId, passwords.get(itsId) ?? '');
+      const mfaPage = afterLogin.page;
+      const done = mfaPage?.kind === 'mfa' ? await submitMfa(b, mfaPage, admin, code) : afterLogin;
+      return { b, flow, mfaPage, done };
+    };
+    const tokensOf = (r: Awaited<ReturnType<typeof loginWith>>) => tokensFrom({ pages: ['login', 'mfa'], step: r.done, flow: r.flow }, admin);
+
+    await scenario('static code accepted for every method', async () => {
+      const email = await loginWith(M.main, STATIC);
+      check('Email OTP member: 123456 completes MFA', email.mfaPage?.method === 'EMAIL_OTP' && Boolean(email.done.callback), email.done.page?.alert);
+      const t = await tokensOf(email);
+      check('ID token: acr aal:2, amr [pwd, otp]', t.claims.acr === AAL2 && same(t.claims.amr, ['pwd', 'otp']));
+      const sms = await loginWith(M.sms, STATIC);
+      check('SMS OTP member: 123456 completes MFA', sms.mfaPage?.method === 'SMS_OTP' && Boolean(sms.done.callback), sms.done.page?.alert);
+      const totp = await loginWith(M.totp, STATIC);
+      check('TOTP member: 123456 completes MFA', totp.mfaPage?.method === 'TOTP' && Boolean(totp.done.callback), totp.done.page?.alert);
+      const none = await loginWith(M.noEmail, STATIC);
+      check('member without any method: gets an MFA step and 123456 completes it', none.mfaPage?.kind === 'mfa' && Boolean(none.done.callback), none.mfaPage?.alert ?? none.done.page?.alert);
+      const plain = await loginWith(M.plain, STATIC);
+      check('another Email member: 123456 completes MFA (all users)', Boolean(plain.done.callback));
+    });
+
+    await scenario('real codes and limits still apply', async () => {
+      const wrong = await loginWith(M.main, '000001');
+      check('a wrong code is still refused ("Incorrect code")', Boolean(wrong.done.page) && /Incorrect code/.test(wrong.done.page?.alert ?? ''), wrong.done.page?.alert);
+      const b = new Browser();
+      const since = Date.now();
+      const { flow, step } = await start(b, admin, { acr: AAL2 });
+      const mfa = (await submitLogin(b, step.page!, admin, M.mfaAll, passwords.get(M.mfaAll)!)).page!;
+      const real = await submitMfa(b, mfa, admin, await codeFor(mfa, M.mfaAll, since));
+      check('the real emailed code still works', Boolean(real.callback) && Boolean((await tokensFrom({ pages: ['login', 'mfa'], step: real, flow }, admin)).idToken));
+      const again = await loginWith(M.mfaAll, STATIC);
+      check('hourly OTP cap (1 here) not applied while testing -> MFA page again, 123456 works', again.mfaPage?.kind === 'mfa' && Boolean(again.done.callback), again.mfaPage?.alert);
+      const totpBad = await loginWith(M.totp, '000001');
+      check('TOTP: a wrong code is still refused', Boolean(totpBad.done.page) && !totpBad.done.callback);
+    });
+
+    await scenario('audit', async () => {
+      const rows: { n: number }[] = await AppDataSource.query(
+        `SELECT count(*)::int AS n FROM auth_audit_events WHERE event_type = 'MFA_SUCCESS' AND metadata->>'staticOtp' = 'true' AND created_at >= $1`,
+        [startedAt],
+      );
+      check('MFA_SUCCESS by the static code is audited with staticOtp: true', rows[0].n >= 5, String(rows[0].n));
+      const [real] = await AppDataSource.query(
+        `SELECT count(*)::int AS n FROM auth_audit_events WHERE event_type = 'MFA_SUCCESS' AND its_id = $1 AND metadata->>'staticOtp' IS NULL AND created_at >= $2`,
+        [M.mfaAll, startedAt],
+      );
+      check('a real code is audited without the flag', real.n >= 1);
+    });
+  });
+
   await profile('6. OTP hourly cap', { OTP_MAX_SENDS_PER_HOUR: '3', OTP_RESEND_COOLDOWN_SECONDS: '0' }, async () => {
     await AppDataSource.query('DELETE FROM auth_otp_challenges WHERE its_id = $1', [M.plain]);
     await scenario('hourly cap', async () => {

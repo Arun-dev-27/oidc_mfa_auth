@@ -114,6 +114,12 @@ Allow-login and eligibility messages are only shown after a correct password.
 * **Adapters** (`src/modules/mfa/adapters`): `EmailOtpAdapter` (SMTP, or `outbox` files in dev),
   `SmsOtpAdapter` (`http` JSON gateway, or `outbox`, or `disabled`). A new channel = one more class
   implementing `OtpDeliveryAdapter`, registered in `mfa.module.ts`.
+* **Static test OTP (testing only)**: `MFA_STATIC_OTP=123456` makes that code work for **every member
+  and every method** — Email OTP, SMS OTP and TOTP — besides the real code. A member with no method at
+  all gets an MFA step that only the static code completes, and the hourly OTP cap is not applied.
+  Wrong codes, attempt limits, expiry and the per-session challenge still apply; each success is
+  audited as `MFA_SUCCESS` with `staticOtp: true`, and the service logs a warning at start-up.
+  Empty = off (default). **The service refuses to start with it in production.**
 
 ## Getting started (local)
 
@@ -340,6 +346,31 @@ the demo target authorization; a MUMIN target is refused by Core with `REALM_MIS
   verified), handoff **out** to a demo app and handoff **in** from a demo app, with a log of every step.
 * The API behind it only accepts JSON requests from the console page (custom header + Origin check), so
   another web site cannot register clients through your browser. There is no delete.
+
+## Postman collection
+
+`postman/Miqaat_Core_Auth.postman_collection.json` (Postman v2.1) — import it in Postman, or run it:
+
+```bash
+npm start && npm run console        # service :4000 + Test Console :5170 (MFA_STATIC_OTP=123456 in .env)
+npx newman run postman/Miqaat_Core_Auth.postman_collection.json
+```
+
+| Folder | What it does |
+|---|---|
+| 0. Setup | Registers the client `postman-dev` through the Test Console API (or issues it a new secret) and fills `client_id` / `client_secret` |
+| 1. Discovery, keys, health | openid-configuration, JWKS, `/health/live`, `/health/ready` |
+| 2. Sign in | `/auth` with PKCE → follow redirects → SSR login form → MFA form (`mfa_code`, default `123456`) → code at the redirect_uri → `POST /token` with **client_secret_basic**; checks the ID token claims |
+| 3. Userinfo | `GET /me` with the access token |
+| 4. Trusted handoff | Create a handoff request, open the one-time URL (signed assertion checked), reuse refused, other realm / unsafe path / no auth refused |
+| 5. Client authentication - refused | No credentials, wrong secret, secret in the body, code replay |
+| 6. Logout | `/logout` with `id_token_hint` → post-logout URI + state, `/me` 401, next sign-in asks for the password |
+
+The sign-in folder chains itself when run (Collection Runner / newman); clicked one by one, the Postman
+console names the next request. Variables: `its_id` / `password` (local test member), `acr_values`
+(`urn:miqaat:aal:2` = with MFA, `urn:miqaat:aal:1` = password only), `mfa_code`, `handoff_target` /
+`handoff_path`. To use another client, skip folder 0 and set `client_id`, `client_secret`, `redirect_uri`
+and `post_logout_redirect_uri`. Development only.
 
 ## Tests
 

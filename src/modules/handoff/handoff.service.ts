@@ -165,7 +165,7 @@ export class HandoffService {
       return this.pages.mfa(req, reply, pending.page, options, option, { challengeId: form.challenge_id ?? null, error: verifyFailureMessage(result) }, 401);
     }
     const upgraded = await this.sessions.upgradeToAal2(session, result.method, req, reply);
-    await this.audit.record({ eventType: 'MFA_SUCCESS', outcome: 'SUCCESS', itsId: member.itsId, sid: upgraded.sid, clientId: pending.target.clientId, metadata: { method: result.method, via: 'handoff' }, ...this.meta(req) });
+    await this.audit.record({ eventType: 'MFA_SUCCESS', outcome: 'SUCCESS', itsId: member.itsId, sid: upgraded.sid, clientId: pending.target.clientId, metadata: { method: result.method, via: 'handoff', ...(result.staticOtp ? { staticOtp: true } : {}) }, ...this.meta(req) });
     return this.deliver(req, reply, pending, member, upgraded);
   }
 

@@ -554,6 +554,9 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
       if (url.pathname === '/api/clients' && req.method === 'POST') {
         const r = await registerClient(AppDataSource, JSON.parse(await readBody(req)) as RegisterInput);
         if (r.secret) trySecrets.set(r.clientId, r.secret);
+        // A new registration starts clean, even if a client with this id existed earlier.
+        trySessions.delete(r.clientId);
+        tryEvents.delete(r.clientId);
         return json(res, 201, r);
       }
       const clientId = url.searchParams.get('client_id') ?? '';
