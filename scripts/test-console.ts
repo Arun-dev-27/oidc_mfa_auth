@@ -16,7 +16,7 @@ import { join, resolve } from 'node:path';
 import { createRemoteJWKSet, decodeProtectedHeader, jwtVerify } from 'jose';
 import { Pool } from 'pg';
 import { loadDotEnv } from '../src/config/env';
-import { decryptString, toKey32 } from '../src/common/crypto.util';
+import { decryptString, safeEqual, toKey32 } from '../src/common/crypto.util';
 import { decrypt } from '../src/modules/identity/legacy-password-cipher';
 import { base32Decode, hotp } from '../src/modules/mfa/totp';
 import { isAllowedPath, normalizeRelativePath } from '../src/modules/handoff/handoff-path';
@@ -28,6 +28,15 @@ if (process.env.NODE_ENV === 'production') throw new Error('the test console is 
 
 const ISSUER = (process.env.ISSUER ?? 'http://localhost:4000').replace(/\/+$/, '');
 const CONSOLE_PORT = Number(process.env.CONSOLE_PORT ?? 5170);
+/**
+ * Hosted mode (e.g. Render): CONSOLE_PUBLIC_URL set -> one public port; the demo apps are served under
+ * <CONSOLE_PUBLIC_URL>/app/<key>/ instead of their own localhost ports. CONSOLE_BASIC_AUTH=user:password
+ * protects the console (it shows test passwords and can register clients).
+ */
+const PUBLIC_URL = (process.env.CONSOLE_PUBLIC_URL || `http://localhost:${CONSOLE_PORT}`).replace(/\/+$/, '');
+const HOSTED = Boolean(process.env.CONSOLE_PUBLIC_URL);
+const HOST = process.env.CONSOLE_HOST || '127.0.0.1';
+const BASIC_AUTH = process.env.CONSOLE_BASIC_AUTH || '';
 const OUTBOX = resolve(process.env.OUTBOX_DIR ?? './.outbox');
 const jwks = createRemoteJWKSet(new URL(`${ISSUER}/.well-known/jwks.json`));
 
@@ -64,6 +73,9 @@ const apps: App[] = [
 
 const pending = new Map<string, { app: App; verifier: string; nonce: string; acr: string }>();
 
+/** Where a demo app lives: its own localhost port, or a path under the public console URL. */
+const appBase = (app: App) => (HOSTED ? `${PUBLIC_URL}/app/${app.key}` : `http://localhost:${app.port}`);
+
 const db = new Pool({
   max: 4,
   host: process.env.DB_HOST,
@@ -76,8 +88,9 @@ const db = new Pool({
 
 async function loadSecrets() {
   for (const app of apps) {
-    const text = await readFile(app.secretFile, 'utf8').catch(() => '');
-    app.secret = text.match(/shown once[^:]*: (\S+)/)?.[1] ?? null;
+    const fromEnv = process.env[`CONSOLE_SECRET_${app.key.toUpperCase().replace(/-/g, '_')}`];
+    const text = fromEnv ? '' : await readFile(app.secretFile, 'utf8').catch(() => '');
+    app.secret = fromEnv || (text.match(/shown once[^:]*: (\S+)/)?.[1] ?? null);
     const [row] = (await db.query('SELECT auth_realm FROM auth_clients WHERE client_id = $1', [app.clientId])).rows;
     app.realm = row?.auth_realm ?? null;
   }
@@ -163,7 +176,7 @@ async function service() {
 
 async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
   const url = new URL(req.url ?? '/', `http://localhost:${app.port}`);
-  const back = (hash = app.key) => res.writeHead(303, { location: `http://localhost:${CONSOLE_PORT}/#${hash}` }).end();
+  const back = (hash = app.key) => res.writeHead(303, { location: `${PUBLIC_URL}/#${hash}` }).end();
 
   if (url.pathname === '/login') {
     if (!app.secret) {
@@ -178,7 +191,7 @@ async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
     const q = new URLSearchParams({
       response_type: 'code',
       client_id: app.clientId,
-      redirect_uri: `http://localhost:${app.port}/auth/callback`,
+      redirect_uri: `${appBase(app)}/auth/callback`,
       scope: 'openid profile',
       state,
       nonce,
@@ -211,7 +224,7 @@ async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
       body: new URLSearchParams({
         grant_type: 'authorization_code',
         code: url.searchParams.get('code') ?? '',
-        redirect_uri: `http://localhost:${app.port}/auth/callback`,
+        redirect_uri: `${appBase(app)}/auth/callback`,
         code_verifier: flow.verifier,
       }),
     });
@@ -235,7 +248,7 @@ async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
   if (url.pathname === '/logout') {
     const state = randomBytes(16).toString('base64url');
     pendingLogout.set(state, app);
-    const q = new URLSearchParams({ client_id: app.clientId, post_logout_redirect_uri: `http://localhost:${app.port}/logged-out`, state });
+    const q = new URLSearchParams({ client_id: app.clientId, post_logout_redirect_uri: `${appBase(app)}/logged-out`, state });
     if (app.session) q.set('id_token_hint', app.session.idToken);
     event(app, app.session ? 'Logout clicked: local session ended, sent to Core /logout (with id_token_hint)' : 'Logout clicked without a local session: Core asks to confirm');
     app.session = null;
@@ -330,7 +343,7 @@ async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
     app.session = { claims: c, me: { note: 'signed in by trusted handoff (no token exchange)', source: c.source_client_id }, kid: result.kid, at: new Date().toISOString(), idToken: '' };
     app.lastError = null;
     event(app, `Handoff from ${String(c.source_client_id)} verified (JWKS, one-time jti) -> local session for ITS ${String(c.sub)} -> ${String(c.requested_path)}`);
-    res.writeHead(303, { location: `http://localhost:${app.port}${String(c.requested_path)}`, 'cache-control': 'no-store' }).end();
+    res.writeHead(303, { location: `${appBase(app)}${String(c.requested_path)}`, 'cache-control': 'no-store' }).end();
     return;
   }
 
@@ -348,7 +361,7 @@ async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
     );
   }
 
-  res.writeHead(303, { location: `http://localhost:${CONSOLE_PORT}/` }).end();
+  res.writeHead(303, { location: `${PUBLIC_URL}/` }).end();
 }
 
 /** Target-local rules: what this demo app lets a handoff open, and who may open it. */
@@ -408,7 +421,7 @@ function page(res: ServerResponse, status: number, app: App, body: string) {
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(app.label)}</title>
 <style>body{font-family:Mulish,system-ui,sans-serif;background:#fbf9f5;color:#1d2b33;margin:0}header{background:linear-gradient(90deg,#10232a,#215f60);color:#fff;padding:16px 24px;font-size:20px}
 main{max-width:760px;margin:28px auto;padding:0 16px}h2{color:#1c5a5c;font-weight:600}code{background:#f4f1ea;padding:2px 6px;border-radius:4px}.err{color:#9b2c1f;font-weight:700}a{color:#1c5a5c}</style></head>
-<body><header>${esc(app.label)} <small style="opacity:.7">· demo BU app · :${app.port}</small></header><main>${body}<p><a href="http://localhost:${CONSOLE_PORT}/#${app.key}">Back to the Test Console</a></p></main></body></html>`);
+<body><header>${esc(app.label)} <small style="opacity:.7">· demo BU app · ${esc(appBase(app))}</small></header><main>${body}<p><a href="${PUBLIC_URL}/#${app.key}">Back to the Test Console</a></p></main></body></html>`);
 }
 
 function esc(v: unknown): string {
@@ -496,13 +509,41 @@ async function logoutDeliveries() {
 
 // ---- console -----------------------------------------------------------------------------------
 
+/** Endpoints Core (server to server) or the browser coming back from Core must reach without the console password; each is protected by state, a signed token or a one-time assertion. */
+const OPEN_PATHS = [/^\/app\/[a-z-]+\/auth\/(callback|core\/logout|core\/handoff)$/, /^\/app\/[a-z-]+\/logged-out$/, /^\/try\/(callback|logged-out)$/, /^\/try\/(backchannel|handoff)\/[a-z0-9-]+$/, /^\/healthz$/];
+
+function authorized(req: IncomingMessage): boolean {
+  if (!BASIC_AUTH) return true;
+  const path = (req.url ?? '/').split('?')[0];
+  if (OPEN_PATHS.some((p) => p.test(path))) return true;
+  const header = req.headers.authorization ?? '';
+  return header.startsWith('Basic ') && safeEqual(Buffer.from(header.slice(6), 'base64').toString('utf8'), BASIC_AUTH);
+}
+
 async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
-  const url = new URL(req.url ?? '/', `http://localhost:${CONSOLE_PORT}`);
+  if (!authorized(req)) {
+    res.writeHead(401, { 'www-authenticate': 'Basic realm="Miqaat Test Console", charset="UTF-8"', 'content-type': 'text/plain' }).end('Test Console: sign in with the console user and password');
+    return;
+  }
+  if (req.url === '/healthz') return json(res, 200, { ok: true });
+  // Hosted mode: /app/<key>/... is that demo app (its own port locally).
+  const appMatch = HOSTED ? /^\/app\/([a-z-]+)(\/.*)?$/.exec(req.url ?? '') : null;
+  const hostedApp = appMatch ? apps.find((a) => a.key === appMatch[1]) : undefined;
+  if (hostedApp) {
+    req.url = appMatch![2] || '/';
+    await appRoute(hostedApp, req, res).catch((e: unknown) => {
+      hostedApp.lastError = e instanceof Error ? e.message : String(e);
+      res.writeHead(303, { location: `${PUBLIC_URL}/#${hostedApp.key}` }).end();
+    });
+    return;
+  }
+  const url = new URL(req.url ?? '/', PUBLIC_URL);
   if (url.pathname === '/api/state') {
     const [o, m, s, a, svc, lo, ck, ho] = await Promise.all([outbox(), members(), coreSessions(), audit(), service(), logoutDeliveries(), browserCookies(req), handoffRequests()]);
     const body = {
       apps: apps.map(({ key, clientId, label, port, realm, secret, session, lastError, events, backchannelDown }) => ({
         key,
+        base: appBase(apps.find((a) => a.key === key)!),
         clientId,
         label,
         port,
@@ -546,7 +587,7 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
   }
   // ---- client registration (same rules as npm run client:register) ------------------------------
   if (url.pathname === '/api/clients' && req.method === 'GET') {
-    return json(res, 200, { clients: await listClients(AppDataSource), tryRedirect: TRY_REDIRECT, tryLoggedOut: TRY_LOGGED_OUT, tryBase: `http://localhost:${CONSOLE_PORT}/try`, trySecrets: [...trySecrets.keys()] });
+    return json(res, 200, { clients: await listClients(AppDataSource), tryRedirect: TRY_REDIRECT, tryLoggedOut: TRY_LOGGED_OUT, tryBase: `${PUBLIC_URL}/try`, trySecrets: [...trySecrets.keys()] });
   }
   if (url.pathname.startsWith('/api/clients')) {
     if (!sameOriginJson(req)) return json(res, 403, { error: 'Requests must come from the Test Console page' });
@@ -751,8 +792,8 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
   res.writeHead(404).end();
 }
 
-const TRY_REDIRECT = `http://localhost:${CONSOLE_PORT}/try/callback`;
-const TRY_LOGGED_OUT = `http://localhost:${CONSOLE_PORT}/try/logged-out`;
+const TRY_REDIRECT = `${PUBLIC_URL}/try/callback`;
+const TRY_LOGGED_OUT = `${PUBLIC_URL}/try/logged-out`;
 /** Secrets of clients registered / rotated in this console session (memory only, dev convenience). */
 const trySecrets = new Map<string, string>();
 const tryPending = new Map<string, { clientId: string; verifier: string; nonce: string }>();
@@ -801,7 +842,7 @@ function sameOriginJson(req: IncomingMessage): boolean {
     req.method === 'POST' &&
     String(req.headers['content-type'] ?? '').startsWith('application/json') &&
     req.headers['x-test-console'] === '1' &&
-    (!origin || origin === `http://localhost:${CONSOLE_PORT}`)
+    (!origin || origin === new URL(PUBLIC_URL).origin)
   );
 }
 
@@ -856,7 +897,7 @@ h3{color:#1c5a5c;margin:22px 0 8px}.err{color:#9b2c1f;font-weight:700}.muted{col
 .btn{border:0;cursor:pointer;font:inherit;font-size:13px;font-weight:700;padding:8px 14px;border-radius:999px;background:#1c5a5c;color:#fff;text-decoration:none}.btn.gold{background:#8a6a45}.btn.red{background:#9b2c1f}.btn.light{background:#e8efee;color:#1c5a5c}
 .status{padding:10px 12px;border-radius:10px;font-size:13.5px;margin-top:10px}.status.in{background:#f0fdf4;border:1px solid #bbf7d0}.status.out{background:#f8fafc;border:1px dashed #e4ded3;color:#5b6770}.status.err{background:#fef2f2;border:1px solid #fecaca;color:#9b2c1f}.status ul{margin:0;padding-left:18px}
 .events{background:#f8fafc;border-radius:8px;padding:10px 12px 10px 28px;font-size:12.5px}.events li{margin:3px 0}.events li.no{color:#9b2c1f}details{margin-top:8px}summary{cursor:pointer;color:#1c5a5c;font-weight:700;font-size:13px}</style></head>
-<body><header>Test app · <code style="background:rgba(255,255,255,.15);color:#fff">${esc(clientId)}</code> <small style="opacity:.7">plays the backend of the client you registered</small></header><main>${body}<p><a href="http://localhost:${CONSOLE_PORT}/#clients">Back to the Test Console</a></p></main></body></html>`);
+<body><header>Test app · <code style="background:rgba(255,255,255,.15);color:#fff">${esc(clientId)}</code> <small style="opacity:.7">plays the backend of the client you registered</small></header><main>${body}<p><a href="${PUBLIC_URL}/#clients">Back to the Test Console</a></p></main></body></html>`);
 }
 
 const PAGE = /* html */ `<!doctype html>
@@ -945,8 +986,8 @@ label.inline{font-size:12.5px;margin-right:16px;display:inline-flex;gap:6px;alig
 <h3 style="margin:16px 0 6px;font-size:15px">Registered clients</h3>
 <table><thead><tr><th>Client</th><th>Realm</th><th>Auth</th><th>Status</th><th>Redirect / logout URIs</th><th>Handoff</th><th>Usable</th><th>Actions</th></tr></thead><tbody id="clientrows"></tbody></table>
 </section>
-<section class="card"><h2>Your browser’s cookies (set by Core on localhost:4000)</h2><table><thead><tr><th>Cookie</th><th>Value</th><th>What it is</th><th>Core session behind it</th></tr></thead><tbody id="cookies"></tbody></table>
-<p class="muted" style="font-size:12.5px;margin:8px 2px 0">Signing in to one ADMIN app sets <b>miqaat-admin-sso</b>; every other ADMIN app is then signed in without a password (SSO). MUMIN has its own cookie, so ADMIN never signs you in to MUMIN. The cookies are HttpOnly (page scripts cannot read them) and hold only a random secret - Core stores just its SHA-256. The console can list them only because all localhost ports share cookies in development.</p></section>
+<section class="card"><h2>Your browser’s cookies (set by Core)</h2><table><thead><tr><th>Cookie</th><th>Value</th><th>What it is</th><th>Core session behind it</th></tr></thead><tbody id="cookies"></tbody></table>
+<p class="muted" style="font-size:12.5px;margin:8px 2px 0">Signing in to one ADMIN app sets <b>miqaat-admin-sso</b>; every other ADMIN app is then signed in without a password (SSO). MUMIN has its own cookie, so ADMIN never signs you in to MUMIN. The cookies are HttpOnly (page scripts cannot read them) and hold only a random secret - Core stores just its SHA-256. The console can list them only when it runs on the same host as Core (localhost in development); on a hosted console this list stays empty - open Core’s cookies in the browser’s developer tools instead.</p></section>
 <section class="grid2">
  <div class="card"><h2>Latest codes (dev outbox)</h2><table><thead><tr><th>Code</th><th>Channel</th><th>To</th><th>Sent</th></tr></thead><tbody id="outbox"></tbody></table></div>
  <div class="card"><h2>Test members</h2><table><thead><tr><th>ITS ID</th><th>Name</th><th>Active</th><th>Allow</th><th>Eligible</th><th>MFA</th><th>Password</th></tr></thead><tbody id="members"></tbody></table></div>
@@ -989,13 +1030,13 @@ function scen(){const done=JSON.parse(localStorage.getItem('scen')||'[]');
  document.getElementById('scenarios').innerHTML='<tr><th></th><th>Do this</th><th>Expected</th></tr>'+SCENARIOS.map((s,i)=>'<tr><td><input type="checkbox" data-i="'+i+'" '+(done.includes(i)?'checked':'')+'></td><td>'+esc(s[0])+'</td><td class="muted">'+esc(s[1])+'</td></tr>').join('');
  document.querySelectorAll('#scenarios input').forEach(c=>c.onchange=()=>{const d=[...document.querySelectorAll('#scenarios input:checked')].map(x=>+x.dataset.i);localStorage.setItem('scen',JSON.stringify(d))});}
 function appCard(a){
- const base='http://localhost:'+a.port;
+ const base=a.base;
  const s=a.session,c=s?.claims||{};
  const state=!a.configured?'<div class="status err">No client secret found in .e2e-'+esc(a.key)+'.txt</div>'
   :a.lastError?'<div class="status err">'+esc(a.lastError)+'</div>':'';
  const body=s?'<div class="status in"><b>'+esc(c.name)+'</b> · ITS '+esc(c.sub)+'<div class="kv"><b>acr</b><span class="mono">'+esc(c.acr)+'</span><b>amr</b><span class="mono">'+esc((c.amr||[]).join(', '))+'</span><b>sid</b><span class="mono">'+esc(c.sid)+'</span><b>aud</b><span class="mono">'+esc(c.aud)+'</span><b>auth_time</b><span>'+esc(new Date(c.auth_time*1000).toLocaleTimeString())+'</span><b>signed by</b><span class="mono">'+esc(s.kid)+'</span></div></div><details><summary>ID token claims · /me</summary><pre>'+esc(JSON.stringify(c,null,2))+'</pre><pre>'+esc(JSON.stringify(s.me,null,2))+'</pre></details>'
   :'<div class="status out">Not signed in to this app</div>';
- return '<div class="card app" id="'+a.key+'"><h3>'+esc(a.label)+'<span class="realm '+esc(a.realm)+'">'+esc(a.realm||'no realm')+'</span></h3><div class="meta mono">'+esc(a.clientId)+' · :'+a.port+'</div>'
+ return '<div class="card app" id="'+a.key+'"><h3>'+esc(a.label)+'<span class="realm '+esc(a.realm)+'">'+esc(a.realm||'no realm')+'</span></h3><div class="meta mono">'+esc(a.clientId)+' · '+esc(a.base)+'</div>'
   +'<div class="btns"><a class="btn" href="'+base+'/login">Sign in (AAL1)</a><a class="btn gold" href="'+base+'/login?acr=aal2">Sign in + MFA (AAL2)</a><a class="btn light" href="'+base+'/login?acr=aal2&max_age=60">AAL2 · MFA ≤ 60 s</a><a class="btn red" href="'+base+'/logout">Logout (all '+esc(a.realm||'')+' apps)</a>'+(s||a.lastError?'<button class="btn light" onclick="clearApp(\\''+a.key+'\\')">Clear</button>':'')+'</div>'+state+body
   +handoffForm(a)
   +'<div class="bc"><label><input type="checkbox" '+(a.backchannelDown?'checked':'')+' onchange="setDown(\\''+a.key+'\\',this.checked)"> back-channel endpoint down (503)</label></div>'
@@ -1003,7 +1044,7 @@ function appCard(a){
 }
 let APPS=[];
 function handoffForm(a){const others=APPS.filter(o=>o.key!==a.key);
- return '<form class="handoff" method="get" action="http://localhost:'+a.port+'/handoff"><span class="muted">Open another app via handoff:</span> <select name="target">'+others.map(o=>'<option value="'+o.key+'">'+esc(o.label)+' ('+esc(o.realm)+')</option>').join('')+'</select> <select name="path"><option>/events/123</option><option>/events/123/details</option><option>/bookings/ABC</option><option>/dashboard</option><option>/admin/users</option></select> <button class="btn light" type="submit">Open via handoff</button></form>';}
+ return '<form class="handoff" method="get" action="'+a.base+'/handoff"><span class="muted">Open another app via handoff:</span> <select name="target">'+others.map(o=>'<option value="'+o.key+'">'+esc(o.label)+' ('+esc(o.realm)+')</option>').join('')+'</select> <select name="path"><option>/events/123</option><option>/events/123/details</option><option>/bookings/ABC</option><option>/dashboard</option><option>/admin/users</option></select> <button class="btn light" type="submit">Open via handoff</button></form>';}
 async function setDown(k,down){await fetch('/api/backchannel?app='+k+'&down='+(down?1:0));load();}
 function cookieRow(c){const s=c.session;let sess='';
  if(c.realm){sess=!c.preview?'<span class="muted">—</span>':!s?'<span class="no">no matching session (already revoked or unknown)</span>':'<span class="'+(s.status==='ACTIVE'?'yes':'no')+'">'+esc(s.status)+'</span> · sid <span class="mono">'+short(s.sid)+'</span> · ITS '+esc(s.its_id)+' · AAL '+esc(s.aal)+(s.mfa_method?' ('+esc(s.mfa_method)+')':'')+'<br><span class="muted">apps: '+esc(s.apps||'—')+' · idle expiry '+time(s.expires_at)+'</span>';}
@@ -1117,18 +1158,18 @@ async function main() {
     fn(req, res).catch((e: unknown) => {
       res.writeHead(500, { 'content-type': 'text/plain' }).end(e instanceof Error ? e.message : String(e));
     });
-  createServer(wrap(consoleRoute)).listen(CONSOLE_PORT, '127.0.0.1');
-  for (const app of apps) {
+  createServer(wrap(consoleRoute)).listen(CONSOLE_PORT, HOST);
+  for (const app of HOSTED ? [] : apps) {
     createServer(
       wrap(async (req, res) => {
         await appRoute(app, req, res).catch((e: unknown) => {
           app.lastError = e instanceof Error ? e.message : String(e);
-          res.writeHead(303, { location: `http://localhost:${CONSOLE_PORT}/#${app.key}` }).end();
+          res.writeHead(303, { location: `${PUBLIC_URL}/#${app.key}` }).end();
         });
       }),
-    ).listen(app.port, '127.0.0.1');
+    ).listen(app.port, HOST);
   }
-  console.log(`Test Console: http://localhost:${CONSOLE_PORT}   (apps on :${apps.map((a) => a.port).join(', :')}; Core ${ISSUER})`);
+  console.log(`Test Console: ${PUBLIC_URL}   (apps ${HOSTED ? `under ${PUBLIC_URL}/app/<key>` : `on :${apps.map((a) => a.port).join(', :')}`}; Core ${ISSUER}${BASIC_AUTH ? '; password protected' : ''})`);
   for (const a of apps) console.log(`  ${a.label.padEnd(10)} ${a.clientId}  realm ${a.realm ?? '-'}  ${a.secret ? 'secret loaded' : `NO SECRET (${a.secretFile})`}`);
 }
 
