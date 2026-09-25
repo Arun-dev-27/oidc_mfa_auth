@@ -9,6 +9,8 @@ import { createWriteStream } from 'node:fs';
 import { mkdir, readdir, readFile, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { createLocalJWKSet, jwtVerify, SignJWT, type JWK, type JWTPayload } from 'jose';
+import type { FormActions } from '../../src/modules/oidc/auth-pages.service';
+import { signinActions } from '../../src/modules/oidc/signin-paths';
 
 export const ISSUER = (process.env.ISSUER ?? 'http://localhost:4000').replace(/\/+$/, '');
 export const ORIGIN = new URL(ISSUER).origin;
@@ -60,8 +62,10 @@ export interface Page {
   status: number;
   html: string;
   uid: string;
-  /** Form base path: /interaction/<uid> (OIDC) or /v1/handoff/<id> (trusted handoff). */
+  /** Form base path: /signin/<uid> (OIDC) or /v1/handoff/<id> (trusted handoff). */
   base: string;
+  /** Where each form posts (the endings differ between the two flows). */
+  actions: FormActions;
   /** Handoff delivery page: the signed assertion and the target callback it auto-POSTs to. */
   assertion: string;
   callback: string;
@@ -72,22 +76,29 @@ export interface Page {
   headers: Headers;
 }
 
+/** Form endings per flow: sign-in /signin/<uid>/password | /verify | /cancel, handoff /v1/handoff/<id>/login | /mfa | /abort. */
+function actionsFor(base: string): FormActions {
+  if (base.startsWith('/signin/')) return signinActions(base.split('/').pop() ?? '');
+  return { login: `${base}/login`, verify: `${base}/mfa`, resend: `${base}/mfa/resend`, switch: `${base}/mfa/switch`, cancel: `${base}/abort` };
+}
+
 const fieldOf = (html: string, name: string) => html.match(new RegExp(`name="${name}" value="([^"]*)"`))?.[1] ?? '';
 
 export function parsePage(status: number, html: string, headers: Headers): Page {
-  const base = html.match(/action="(\/(?:interaction|v1\/handoff)\/[^/"]+)\//)?.[1] ?? '';
+  const base = html.match(/action="(\/(?:signin|v1\/handoff)\/[^/"]+)\//)?.[1] ?? '';
+  const actions = actionsFor(base);
   const uid = base.split('/').pop() ?? '';
   const assertion = fieldOf(html, 'assertion');
   const callback = assertion ? (html.match(/<form[^>]*action="([^"]+)"[^>]*data-autosubmit/)?.[1] ?? '').replace(/&amp;/g, '&') : '';
   const kind: PageKind = assertion
     ? 'handoff'
-    : base && html.includes(`${base}/login"`)
+    : base && html.includes(`action="${actions.login}"`)
       ? 'login'
-      : base && (html.includes(`${base}/mfa"`) || html.includes('/mfa/resend"'))
+      : base && (html.includes(`action="${actions.verify}"`) || html.includes(`action="${actions.resend}"`))
         ? 'mfa'
         : 'error';
   const alert = html.match(/class="alert alert-(?:error|info)"[^>]*>([^<]*)</)?.[1]?.trim() ?? '';
-  return { kind, status, html, uid, base, assertion, callback, csrf: fieldOf(html, 'csrf'), method: fieldOf(html, 'method'), challengeId: fieldOf(html, 'challenge_id'), alert, headers };
+  return { kind, status, html, uid, base, actions, assertion, callback, csrf: fieldOf(html, 'csrf'), method: fieldOf(html, 'method'), challengeId: fieldOf(html, 'challenge_id'), alert, headers };
 }
 
 // ---- authorization flow ------------------------------------------------------------------------
@@ -172,23 +183,23 @@ export async function start(browser: Browser, client: TestClient, p: AuthorizePa
 }
 
 export async function submitLogin(browser: Browser, page: Page, client: TestClient, itsId: string, password: string, form: Record<string, string> = {}) {
-  return follow(browser, await browser.post(`${page.base}/login`, { csrf: page.csrf, its_id: itsId, password, ...form }), client.redirectUri);
+  return follow(browser, await browser.post(page.actions.login, { csrf: page.csrf, its_id: itsId, password, ...form }), client.redirectUri);
 }
 
 export async function submitMfa(browser: Browser, page: Page, client: TestClient, code: string) {
-  return follow(browser, await browser.post(`${page.base}/mfa`, { csrf: page.csrf, code, challenge_id: page.challengeId, method: page.method }), client.redirectUri);
+  return follow(browser, await browser.post(page.actions.verify, { csrf: page.csrf, code, challenge_id: page.challengeId, method: page.method }), client.redirectUri);
 }
 
 export async function resend(browser: Browser, page: Page, client: TestClient) {
-  return follow(browser, await browser.post(`${page.base}/mfa/resend`, { csrf: page.csrf, method: page.method }), client.redirectUri);
+  return follow(browser, await browser.post(page.actions.resend, { csrf: page.csrf, method: page.method }), client.redirectUri);
 }
 
 export async function switchMethod(browser: Browser, page: Page, client: TestClient, method: string) {
-  return follow(browser, await browser.post(`${page.base}/mfa/switch`, { csrf: page.csrf, method }), client.redirectUri);
+  return follow(browser, await browser.post(page.actions.switch, { csrf: page.csrf, method }), client.redirectUri);
 }
 
 export async function abort(browser: Browser, page: Page, client: TestClient) {
-  return follow(browser, await browser.post(`${page.base}/abort`, { csrf: page.csrf }), client.redirectUri);
+  return follow(browser, await browser.post(page.actions.cancel, { csrf: page.csrf }), client.redirectUri);
 }
 
 // ---- token endpoint --------------------------------------------------------------------------

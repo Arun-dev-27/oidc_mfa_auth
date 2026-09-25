@@ -82,7 +82,7 @@ async function signIn(page: Page, appKey: string, button: string, itsId: string,
       if (seen.filter((s) => s === 'mfa').length > 1) throw new Error(`MFA rejected: ${await alertText(page)}`);
       const code = await latestCodeAfter((page as unknown as { __since?: number }).__since ?? Date.now() - 10_000);
       await page.fill('#code', code);
-      await Promise.all([page.waitForURL((u) => u.toString().startsWith(CONSOLE) || u.toString().includes('/interaction/'), { timeout: 15_000 }), page.click('button[data-submit]')]);
+      await Promise.all([page.waitForURL((u) => u.toString().startsWith(CONSOLE) || u.toString().includes('/signin/'), { timeout: 15_000 }), page.click('button[data-submit]')]);
     } else {
       throw new Error(`unexpected page: ${text.slice(0, 200)}`);
     }
@@ -308,7 +308,7 @@ async function main() {
         } else if (await cp.locator('#code').count()) {
           seen.push('mfa');
           await cp.fill('#code', await latestCodeAfter(since));
-          await Promise.all([cp.waitForURL((u) => !u.toString().includes('/mfa'), { timeout: 15_000 }).catch(() => undefined), cp.click('button[data-submit]')]);
+          await Promise.all([cp.waitForURL((u) => !u.toString().includes('/verify'), { timeout: 15_000 }).catch(() => undefined), cp.click('button[data-submit]')]);
         } else break;
       }
       await cp.waitForLoadState('load');

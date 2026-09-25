@@ -15,6 +15,7 @@ import { RateLimitService } from '../security/rate-limit.service';
 import { GlobalSessionService, type RealmSession } from '../sessions/global-session.service';
 import { AuthPagesService, loginFailureMessage, minutes, startFailureMessage, verifyFailureMessage, type PageTarget } from './auth-pages.service';
 import { ClientRegistryService } from './client-registry.service';
+import { signinActions } from './signin-paths';
 import { grantContextKey, OIDC_PROVIDER, sessionGrantsKey, type GrantContext, type OidcProvider } from './oidc.constants';
 
 /** Everything the interaction needs about the pending authorization request. */
@@ -74,7 +75,7 @@ export class InteractionService {
     private readonly pages: AuthPagesService,
   ) {}
 
-  // ---- GET /interaction/:uid ---------------------------------------------------------------
+  // ---- GET /signin/:uid ---------------------------------------------------------------------
 
   async show(req: FastifyRequest, reply: FastifyReply, uid: string): Promise<void> {
     const ctx = await this.context(req, reply, uid);
@@ -92,7 +93,7 @@ export class InteractionService {
     return this.afterPrimary(req, reply, ctx, member, session);
   }
 
-  // ---- POST /interaction/:uid/login --------------------------------------------------------
+  // ---- POST /signin/:uid/password ------------------------------------------------------------
 
   async login(req: FastifyRequest, reply: FastifyReply, uid: string, form: LoginForm): Promise<void> {
     const ctx = await this.context(req, reply, uid);
@@ -123,7 +124,7 @@ export class InteractionService {
     return this.afterPrimary(req, reply, ctx, result.member, session);
   }
 
-  // ---- POST /interaction/:uid/mfa ----------------------------------------------------------
+  // ---- POST /signin/:uid/verify --------------------------------------------------------------
 
   async verifyMfa(req: FastifyRequest, reply: FastifyReply, uid: string, form: MfaForm): Promise<void> {
     const state = await this.mfaState(req, reply, uid, form);
@@ -141,7 +142,7 @@ export class InteractionService {
     return this.finish(req, reply, ctx, member, upgraded);
   }
 
-  // ---- POST /interaction/:uid/mfa/resend and /mfa/switch --------------------------------------
+  // ---- POST /signin/:uid/verify/resend and /verify/switch ------------------------------------
 
   async sendCode(req: FastifyRequest, reply: FastifyReply, uid: string, form: MfaForm, resend: boolean): Promise<void> {
     const state = await this.mfaState(req, reply, uid, form);
@@ -153,7 +154,7 @@ export class InteractionService {
     return this.renderMfa(req, reply, ctx, options, option, started.ok ? { challengeId: started.challengeId, info: resend ? 'A new code has been sent.' : undefined } : { error: startFailureMessage(started) });
   }
 
-  // ---- POST /interaction/:uid/abort --------------------------------------------------------
+  // ---- POST /signin/:uid/cancel --------------------------------------------------------------
 
   async abort(req: FastifyRequest, reply: FastifyReply, uid: string, form: { csrf?: string }): Promise<void> {
     const ctx = await this.context(req, reply, uid);
@@ -290,7 +291,7 @@ export class InteractionService {
   // ---- rendering (shared Core pages) ------------------------------------------------------
 
   private page(ctx: InteractionContext): PageTarget {
-    return { formBase: `/interaction/${ctx.uid}`, csrfScope: ctx.uid, clientName: ctx.clientName, realm: ctx.realm };
+    return { actions: signinActions(ctx.uid), csrfScope: ctx.uid, clientName: ctx.clientName, realm: ctx.realm };
   }
 
   private renderLogin(req: FastifyRequest, reply: FastifyReply, ctx: InteractionContext, data: { error?: string; info?: string; itsId?: string }, status = 200) {

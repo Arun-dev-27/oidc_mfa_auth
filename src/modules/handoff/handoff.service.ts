@@ -11,7 +11,7 @@ import { AuditService } from '../audit/audit.service';
 import { CredentialService, type Member } from '../identity/credential.service';
 import { SigningKeyService } from '../keys/signing-key.service';
 import { ACR_AAL1, ACR_AAL2, MfaService, type MfaOption } from '../mfa/mfa.service';
-import { AuthPagesService, loginFailureMessage, minutes, startFailureMessage, verifyFailureMessage, type PageTarget } from '../oidc/auth-pages.service';
+import { AuthPagesService, loginFailureMessage, minutes, startFailureMessage, verifyFailureMessage, type FormActions, type PageTarget } from '../oidc/auth-pages.service';
 import { ClientAuthService } from '../oidc/client-auth.service';
 import { CsrfService } from '../security/csrf.service';
 import { RateLimitService } from '../security/rate-limit.service';
@@ -263,7 +263,7 @@ export class HandoffService {
       await this.pages.error(reply, 'Link expired', 'This link has expired or was already used. Go back to the application and try again.', 'HANDOFF_REQUEST_EXPIRED', 400);
       return null;
     }
-    return { request, target, page: { formBase: `/v1/handoff/${id}`, csrfScope: `handoff:${id}`, clientName: target.name, realm: target.authRealm } };
+    return { request, target, page: { actions: handoffActions(id), csrfScope: `handoff:${id}`, clientName: target.name, realm: target.authRealm } };
   }
 
   private async mfaState(req: FastifyRequest, reply: FastifyReply, id: string, form: Record<string, string | undefined>) {
@@ -298,4 +298,10 @@ export class HandoffService {
     const m = requestMeta(req);
     return { ipAddress: m.ip, userAgent: m.userAgent };
   }
+}
+
+/** Form targets of the login / MFA pages shown during a handoff (routes in handoff.controller.ts). */
+function handoffActions(id: string): FormActions {
+  const base = `/v1/handoff/${id}`;
+  return { login: `${base}/login`, verify: `${base}/mfa`, resend: `${base}/mfa/resend`, switch: `${base}/mfa/switch`, cancel: `${base}/abort` };
 }

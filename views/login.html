@@ -4,7 +4,7 @@
 {{#error}}<div class="alert alert-error" role="alert">{{error}}</div>{{/error}}
 {{#info}}<div class="alert alert-info" role="status">{{info}}</div>{{/info}}
 
-<form method="post" action="{{formBase}}/login" class="form" autocomplete="on" data-auth-form>
+<form method="post" action="{{loginAction}}" class="form" autocomplete="on" data-auth-form>
   <input type="hidden" name="csrf" value="{{csrf}}" />
 
   <label for="its_id" class="label">ITS ID</label>
@@ -35,7 +35,7 @@
   <button type="submit" class="button" data-submit>Login</button>
 </form>
 
-<form method="post" action="{{formBase}}/abort" class="cancel-form">
+<form method="post" action="{{cancelAction}}" class="cancel-form">
   <input type="hidden" name="csrf" value="{{csrf}}" />
   <p class="muted">Signing in to <strong>{{clientName}}</strong> · {{realmLabel}}</p>
   <button type="submit" class="link-button">Cancel</button>

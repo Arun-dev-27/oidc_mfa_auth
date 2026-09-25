@@ -30,11 +30,11 @@ permissions) stays in each Business Unit.
 | `POST /token` | oidc-provider | code exchange, client authenticated with `client_secret_basic` (standard; see Client authentication) |
 | `GET /me` | oidc-provider | userinfo |
 | `POST /token/revocation` | oidc-provider | token revocation |
-| `GET /interaction/:uid` | Nest SSR | realm gate: silent SSO, login page or MFA page |
-| `POST /interaction/:uid/login` | Nest SSR | ITS ID + password |
-| `POST /interaction/:uid/mfa` | Nest SSR | verify the code |
-| `POST /interaction/:uid/mfa/resend` · `/mfa/switch` | Nest SSR | new code · other method |
-| `POST /interaction/:uid/abort` | Nest SSR | cancel → `access_denied` to the app |
+| `GET /signin/:uid` | Nest SSR | realm gate: silent SSO, login page or MFA page |
+| `POST /signin/:uid/password` | Nest SSR | ITS ID + password |
+| `POST /signin/:uid/verify` | Nest SSR | verify the code |
+| `POST /signin/:uid/verify/resend` · `/verify/switch` | Nest SSR | new code · other method |
+| `POST /signin/:uid/cancel` | Nest SSR | cancel → `access_denied` to the app |
 | `GET /logout` · `POST /logout/confirm` | Nest SSR | realm-wide logout (advertised as `end_session_endpoint`) |
 | `POST /v1/handoff/requests` | Nest (JSON) | source BU backend asks for a handoff (client-authenticated) |
 | `GET /v1/handoff/:id` | Nest SSR | browser: realm session check → signed assertion auto-POSTed to the target |
@@ -62,7 +62,7 @@ src/
     sessions/                  GlobalSessionService (realm cookie, Redis hot copy + auth_sessions)
     mfa/                       MfaService, TOTP, adapters/{email,sms}-otp.adapter.ts + registry
     keys/                      SigningKeyService (file or AWS KMS via ExternalSigningKey) + metadata sync
-    oidc/                      provider.factory.ts, Redis adapter, client registry, interaction service/controller
+    oidc/                      provider.factory.ts, Redis adapter, client registry, sign-in (interaction) service/controller, signin-paths.ts
     views/                     tiny SSR template renderer
     security/ audit/ health/
 views/                         layout.html, login.html, mfa.html, error.html   (edit freely)

@@ -10,6 +10,7 @@ import type { ViewService } from '../views/view.service';
 import type { ClientRegistryService } from './client-registry.service';
 import { grantContextKey, OIDC_ROUTES, type GrantContext } from './oidc.constants';
 import { OidcRedisAdapter } from './oidc-redis.adapter';
+import { signinUrl } from './signin-paths';
 
 export interface ProviderDeps {
   env: Env;
@@ -90,7 +91,7 @@ export function createProvider(d: ProviderDeps): Provider {
     },
 
     interactions: {
-      url: (_ctx, interaction) => `/interaction/${interaction.uid}`,
+      url: (_ctx, interaction) => signinUrl(interaction.uid),
       policy,
     },
 

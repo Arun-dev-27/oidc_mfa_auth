@@ -135,25 +135,25 @@ async function main() {
       continue;
     }
     const html = await res.text();
-    if (res.status >= 400 && !html.includes('/login"') && !html.includes('/mfa"')) {
+    if (res.status >= 400 && !html.includes('/password"') && !html.includes('/verify"')) {
       throw new Error(`HTTP ${res.status}: ${alertText(html) ?? html.slice(0, 300)}`);
     }
-    const uid = html.match(/action="\/interaction\/([^/"]+)\//)?.[1];
+    const uid = html.match(/action="\/signin\/([^/"]+)\//)?.[1];
     if (!uid) throw new Error(`unexpected page (HTTP ${res.status}): ${html.slice(0, 300)}`);
     const csrf = field(html, 'csrf');
     const post = (path: string, body: Record<string, string>) =>
-      request(jar, `${ISSUER}/interaction/${uid}/${path}`, {
+      request(jar, `${ISSUER}/signin/${uid}/${path}`, {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded', origin: new URL(ISSUER).origin },
         body: new URLSearchParams({ csrf, ...body }).toString(),
       });
 
-    if (html.includes(`/interaction/${uid}/login"`)) {
+    if (html.includes(`/signin/${uid}/password"`)) {
       if (seen.includes('login')) throw new Error(`login rejected: ${alertText(html)}`);
       seen.push('login');
       console.log('  page: LOGIN  -> submitting ITS ID + password');
-      res = await post('login', { its_id: itsId, password });
-    } else if (html.includes(`/interaction/${uid}/mfa"`)) {
+      res = await post('password', { its_id: itsId, password });
+    } else if (html.includes(`/signin/${uid}/verify"`)) {
       const mfaVisits = seen.filter((s) => s === 'mfa').length;
       if (mfaVisits > (wrongCodeFirst ? 1 : 0)) {
         if (!(wrongCodeFirst && mfaVisits === 1)) throw new Error(`MFA rejected: ${alertText(html)}`);
@@ -165,7 +165,7 @@ async function main() {
       console.log(`  page: MFA (${method}) -> ${alertText(html) ?? 'code sent'}`);
       const code = wrongCodeFirst && mfaVisits === 0 ? '000000' : await latestOutboxCode(Date.now() - 15_000);
       console.log('  MFA: code read from dev outbox, submitting');
-      res = await post('mfa', { code, challenge_id: challengeId, method });
+      res = await post('verify', { code, challenge_id: challengeId, method });
     } else {
       throw new Error(`unexpected page: ${alertText(html) ?? html.slice(0, 200)}`);
     }

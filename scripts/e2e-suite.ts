@@ -752,17 +752,17 @@ async function main() {
       check('X-Content-Type-Options: nosniff', p.headers.get('x-content-type-options') === 'nosniff');
       // no-referrer would make real browsers send "Origin: null" on the login POST (CSRF rejects it).
       check('Referrer-Policy: same-origin (browsers keep the real Origin on form POSTs)', p.headers.get('referrer-policy') === 'same-origin');
-      const nullOrigin = await b.post(`/interaction/${p.uid}/login`, { csrf: p.csrf, its_id: M.main, password: 'x' }, 'null');
+      const nullOrigin = await b.post(`/signin/${p.uid}/password`, { csrf: p.csrf, its_id: M.main, password: 'x' }, 'null');
       check('POST with "Origin: null" is still refused', nullOrigin.status === 403);
-      const noToken = await b.fetch(`/interaction/${p.uid}/login`, {
+      const noToken = await b.fetch(`/signin/${p.uid}/password`, {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded', origin: new URL(ISSUER).origin },
         body: new URLSearchParams({ its_id: M.main, password: passwords.get(M.main)! }).toString(),
       });
       check('POST without CSRF token -> 403', noToken.status === 403);
-      const crossSite = await b.post(`/interaction/${p.uid}/login`, { csrf: p.csrf, its_id: M.main, password: passwords.get(M.main)! }, 'https://evil.example');
+      const crossSite = await b.post(`/signin/${p.uid}/password`, { csrf: p.csrf, its_id: M.main, password: passwords.get(M.main)! }, 'https://evil.example');
       check('POST from another Origin -> 403', crossSite.status === 403);
-      const login = await b.post(`/interaction/${p.uid}/login`, { csrf: p.csrf, its_id: M.main, password: passwords.get(M.main)! });
+      const login = await b.post(`/signin/${p.uid}/password`, { csrf: p.csrf, its_id: M.main, password: passwords.get(M.main)! });
       const setCookies = login.headers.getSetCookie().join('\n');
       check('realm cookie is HttpOnly + SameSite=Lax', new RegExp(`${ADMIN_COOKIE}=[^;]+;.*HttpOnly`, 'i').test(setCookies) && /SameSite=Lax/i.test(setCookies));
     });
@@ -1414,7 +1414,7 @@ async function main() {
       const cancel = await hand(admin, admin2, '/dashboard');
       const cb = new Browser();
       const login = await follow(cb, await cb.fetch(cancel.body.browser_redirect_url), 'http://never/');
-      const ab = await cb.post(`${login.page!.base}/abort`, { csrf: login.page!.csrf });
+      const ab = await cb.post(login.page!.actions.cancel, { csrf: login.page!.csrf });
       const [crow] = await AppDataSource.query('SELECT status FROM handoff_requests WHERE id = $1', [cancel.body.handoff_request_id]);
       check('cancel on the handoff login page -> CANCELLED, no assertion', crow?.status === 'CANCELLED' && ab.status < 500, `${crow?.status} ${ab.status}`);
     });

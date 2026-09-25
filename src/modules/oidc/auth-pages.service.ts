@@ -7,14 +7,23 @@ import type { MfaOption, StartOtpResult, VerifyResult } from '../mfa/mfa.service
 import { CsrfService } from '../security/csrf.service';
 import { escapeHtml, ViewService, type ViewData } from '../views/view.service';
 
+/** Where each form of the login / MFA pages posts to. */
+export interface FormActions {
+  login: string;
+  verify: string;
+  resend: string;
+  switch: string;
+  cancel: string;
+}
+
 /**
  * Where a login / MFA page posts to. The same SSR pages serve two flows:
- *   OIDC interaction   formBase = /interaction/<uid>
- *   trusted handoff    formBase = /v1/handoff/<request id>
+ *   OIDC sign-in       /signin/<uid>/password | /verify | /verify/resend | /verify/switch | /cancel
+ *   trusted handoff    /v1/handoff/<request id>/login | /mfa | /mfa/resend | /mfa/switch | /abort
  * `csrfScope` binds the CSRF token to that flow instance.
  */
 export interface PageTarget {
-  formBase: string;
+  actions: FormActions;
   csrfScope: string;
   clientName: string;
   realm: AuthRealm;
@@ -32,7 +41,8 @@ export class AuthPagesService {
   login(req: FastifyRequest, reply: FastifyReply, t: PageTarget, data: { error?: string; info?: string; itsId?: string }, status = 200) {
     return this.send(reply, status, 'login', {
       title: 'Login to Continue',
-      formBase: t.formBase,
+      loginAction: t.actions.login,
+      cancelAction: t.actions.cancel,
       csrf: this.csrf.issue(req, reply, t.csrfScope),
       clientName: t.clientName,
       realmLabel: t.realm === 'ADMIN' ? 'Admin portal' : 'Mumin portal',
@@ -57,14 +67,16 @@ export class AuthPagesService {
       .filter((o) => o.method !== option.method)
       .map(
         (o) =>
-          `<form method="post" action="${escapeHtml(t.formBase)}/mfa/switch" class="inline-form">` +
+          `<form method="post" action="${escapeHtml(t.actions.switch)}" class="inline-form">` +
           `<input type="hidden" name="csrf" value="${escapeHtml(csrf)}"><input type="hidden" name="method" value="${escapeHtml(o.method)}">` +
           `<button type="submit" class="link-button">Use ${escapeHtml(o.label)} (${escapeHtml(o.masked)}) instead</button></form>`,
       )
       .join('');
     return this.send(reply, status, 'mfa', {
       title: 'Verify it’s you',
-      formBase: t.formBase,
+      verifyAction: t.actions.verify,
+      resendAction: t.actions.resend,
+      cancelAction: t.actions.cancel,
       csrf,
       method: option.method,
       isTotp: option.method === 'TOTP',
