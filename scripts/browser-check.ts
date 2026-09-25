@@ -193,6 +193,10 @@ async function main() {
     check('Signed in to RMS Admin, AMS Admin (SSO) and RMS Mumin', Boolean(a1.claims && a2.claims && m1.claims) && a2.seen.length === 0);
 
     await lb.goto(`${CONSOLE}/`);
+    // Only this logout's deliveries count (the console lists the latest 10 of any run).
+    const logoutAt = new Date(Date.now() - 5000).toISOString();
+    type Delivery = { client_id: string; status: string; created_at: string };
+    const thisLogout = async () => (((await (await cfetch(`${CONSOLE}/api/state`)).json()) as { logout: Delivery[] }).logout).filter((d) => d.created_at >= logoutAt);
     await Promise.all([lb.waitForURL((u) => u.toString().startsWith(CONSOLE), { timeout: 15_000 }), lb.locator('#rms-admin').getByRole('link', { name: /^Logout/ }).click()]);
     check('Logout on RMS Admin returns straight to the console (id_token_hint -> no confirmation)', lb.url().startsWith(CONSOLE));
     const afterLogout = await waitFor(async () => {
@@ -207,9 +211,9 @@ async function main() {
     // The BU may clear its session a moment before Core records the 200, so wait for the final status.
     const deliveries =
       (await waitFor(async () => {
-        const l = ((await (await cfetch(`${CONSOLE}/api/state`)).json()) as { logout: { client_id: string; status: string }[] }).logout;
+        const l = await thisLogout();
         return ['rms-admin-dev', 'ams-admin-dev'].every((c) => l.some((d) => d.client_id === c && d.status === 'SUCCEEDED')) ? l : null;
-      })) ?? ((await (await cfetch(`${CONSOLE}/api/state`)).json()) as { logout: { client_id: string; status: string }[] }).logout;
+      })) ?? (await thisLogout());
     check('Deliveries: RMS Admin + AMS Admin SUCCEEDED, none to MUMIN',
       ['rms-admin-dev', 'ams-admin-dev'].every((c) => deliveries.some((d) => d.client_id === c && d.status === 'SUCCEEDED')) && !deliveries.some((d) => d.client_id === 'rms-mumin-dev'),
       JSON.stringify(deliveries.slice(0, 3)));
@@ -253,6 +257,16 @@ async function main() {
     console.log('\n=== Real browser: trusted handoff (RMS Admin -> AMS Admin)');
     for (const key of ['rms-admin', 'ams-admin', 'rms-mumin']) await cfetch(`${CONSOLE}/api/clear?app=${key}`);
     const hb = await (await browser.newContext(CTX)).newPage();
+    // No local session on the source: the handoff click signs in first, then continues to the target.
+    await hb.goto(`${CONSOLE}/`);
+    const first = hb.locator('#rms-admin form.handoff');
+    await first.locator('select[name="target"]').selectOption('ams-admin');
+    await first.locator('select[name="path"]').selectOption('/events/123');
+    await Promise.all([hb.waitForSelector('#its_id'), first.getByRole('button', { name: 'Open via handoff' }).click()]);
+    await hb.fill('#its_id', '10110101');
+    await hb.fill('#password', pw('10110101'));
+    await Promise.all([hb.waitForURL((u) => u.toString() === `${AMS}/events/123`, { timeout: 20_000 }).catch(() => undefined), hb.click('button[data-submit]')]);
+    check('Handoff without a session on RMS Admin: login page, then lands on AMS Admin /events/123', hb.url() === `${AMS}/events/123`, hb.url());
     const src = await signIn(hb, 'rms-admin', 'Sign in (AAL1)', '10110101', pw('10110101'));
     let assertion = '';
     hb.on('request', (r) => {
@@ -340,6 +354,23 @@ async function main() {
     check('Listed: ADMIN, client_secret_basic, ACTIVE, handoff out+in, usable', row.includes('ADMIN') && row.includes('client_secret_basic') && row.includes('ACTIVE') && row.includes('out in') && /\byes\b/.test(row), row);
     const [dbRow] = (await dbQuery('SELECT client_secret_enc, token_endpoint_auth_method, status FROM auth_clients WHERE client_id = $1', [UI_CLIENT])) as { client_secret_enc: string; token_endpoint_auth_method: string; status: string }[];
     check('Stored in auth_clients: encrypted secret (not the plain one), client_secret_basic, ACTIVE', Boolean(dbRow) && !dbRow.client_secret_enc.includes(secret1) && dbRow.token_endpoint_auth_method === 'client_secret_basic' && dbRow.status === 'ACTIVE');
+
+    // 1b. Handoff OUT from the new client without a local session (fresh browser): sign in first, then land.
+    const cq = await (await browser.newContext(CTX)).newPage();
+    await cq.goto(TEST_APP);
+    const outForm = cq.locator('form[action="/try/handoff-out"]');
+    await outForm.locator('select[name="target"]').selectOption('ams-admin-dev');
+    await outForm.locator('select[name="path"]').selectOption('/events/123');
+    await Promise.all([cq.waitForSelector('#its_id'), outForm.getByRole('button', { name: 'Open via handoff' }).click()]);
+    await cq.fill('#its_id', USER);
+    await cq.fill('#password', pw(USER));
+    await Promise.all([cq.waitForURL((u) => u.toString() === `${AMS}/events/123`, { timeout: 20_000 }).catch(() => undefined), cq.click('button[data-submit]')]);
+    const landedFirst = (await cq.locator('main').innerText()).replace(/\s+/g, ' ');
+    check('Test app, handoff out without a session: login page, then lands on AMS Admin /events/123 from the new client', cq.url() === `${AMS}/events/123` && landedFirst.includes(UI_CLIENT) && landedFirst.includes('trusted handoff'), `${cq.url()} ${landedFirst.slice(0, 120)}`);
+    await cq.goto(TEST_APP);
+    const tryAfter = (await cq.locator('main').innerText()).replace(/\s+/g, ' ');
+    check('Test app: signed in by that login; events "signing in first" and "Core request created"', tryAfter.includes(`Signed in as ITS ${USER}`) && tryAfter.includes('no local session - signing in first') && tryAfter.includes('Core request created'), tryAfter.slice(0, 200));
+    await cq.context().close();
 
     // 2. Open the test app and sign in at AAL1.
     await Promise.all([cp.waitForLoadState('load'), cp.locator('#regresult').getByRole('link', { name: 'Open test app' }).click()]);

@@ -71,7 +71,8 @@ const apps: App[] = [
   { key: 'rms-mumin', clientId: 'rms-mumin-dev', label: 'RMS Mumin', port: 5175 },
 ].map((a) => ({ ...a, secretFile: `.e2e-${a.key}.txt`, secret: null, realm: null, session: null, lastError: null, events: [], backchannelDown: false }));
 
-const pending = new Map<string, { app: App; verifier: string; nonce: string; acr: string }>();
+/** Sign-ins in progress; `then` = a handoff to continue once signed in (target app key + path). */
+const pending = new Map<string, { app: App; verifier: string; nonce: string; acr: string; then?: { target: string; path: string } }>();
 
 // ---- per-browser state -----------------------------------------------------------------------
 /**
@@ -279,7 +280,9 @@ async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
     const state = randomBytes(16).toString('base64url');
     const nonce = randomBytes(16).toString('base64url');
     const acr = url.searchParams.get('acr') === 'aal2' ? 'urn:miqaat:aal:2' : '';
-    pending.set(state, { app, verifier, nonce, acr });
+    const thenTarget = url.searchParams.get('then_target');
+    const then = thenTarget ? { target: thenTarget, path: (url.searchParams.get('then_path') || '/dashboard').slice(0, 512) } : undefined;
+    pending.set(state, { app, verifier, nonce, acr, then });
     const q = new URLSearchParams({
       response_type: 'code',
       client_id: app.clientId,
@@ -333,6 +336,11 @@ async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
     const me = await fetch(`${ISSUER}/me`, { headers: { authorization: `Bearer ${tokens.access_token}` } }).then((r) => r.json());
     app.session = { claims: payload as Record<string, unknown>, me, kid: decodeProtectedHeader(tokens.id_token).kid, at: new Date().toISOString(), idToken: tokens.id_token };
     app.lastError = flow.acr && payload.acr !== flow.acr ? `asked for ${flow.acr}, got ${String(payload.acr)}` : null;
+    // Signed in because a handoff was asked for: continue it now that the source has a local session.
+    if (flow.then) {
+      res.writeHead(303, { location: `${appBase(app)}/handoff?${new URLSearchParams(flow.then)}` }).end();
+      return;
+    }
     return back();
   }
 
@@ -408,11 +416,13 @@ async function appRoute(app: App, req: IncomingMessage, res: ServerResponse) {
   if (url.pathname === '/handoff') {
     const target = apps.find((a) => a.key === url.searchParams.get('target'));
     const path = url.searchParams.get('path') ?? '/dashboard';
-    if (!app.session) {
-      event(app, 'Handoff refused: sign in to this app first (source must have a local session)', false);
-      return back();
-    }
     if (!target) return back();
+    if (!app.session) {
+      // No local session on the source: sign in first (Core /auth), then continue this handoff from the callback.
+      event(app, `Handoff to ${target.label} ${path}: no local session - signing in first, the handoff continues after sign-in`);
+      res.writeHead(303, { location: `${appBase(app)}/login?${new URLSearchParams({ then_target: target.key, then_path: path })}` }).end();
+      return;
+    }
     const r = await fetch(`${ISSUER}/v1/handoff/requests`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Basic ${Buffer.from(`${app.clientId}:${app.secret}`).toString('base64')}` },
@@ -749,7 +759,9 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     const state = randomBytes(12).toString('base64url');
     const nonce = randomBytes(12).toString('base64url');
     const acr = url.searchParams.get('acr') ?? '';
-    tryPending.set(state, { clientId, verifier, nonce });
+    const thenTarget = url.searchParams.get('then_target');
+    const then = thenTarget ? { target: thenTarget, path: (url.searchParams.get('then_path') || '/dashboard').slice(0, 512) } : undefined;
+    tryPending.set(state, { clientId, verifier, nonce, then });
     tryEvent(B!, clientId, `Sign-in started${acr ? ` (acr_values ${acr.replace('urn:miqaat:', '')})` : ''}: browser sent to Core /auth with PKCE S256`);
     const q = new URLSearchParams({
       response_type: 'code',
@@ -791,6 +803,11 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     const me = await fetch(`${ISSUER}/me`, { headers: { authorization: `Bearer ${body.access_token}` } }).then((r) => r.json());
     B!.trySessions.set(flow.clientId, { claims: payload, idToken: body.id_token, accessToken: body.access_token ?? '', me, at: new Date().toISOString(), via: 'sign-in' });
     tryEvent(B!, flow.clientId, `Signed in: code exchanged at /token with Authorization: Basic, ID token verified (kid ${protectedHeader.kid}), ${String(payload.acr).replace('urn:miqaat:', '')}, amr ${JSON.stringify(payload.amr)}`);
+    // Signed in because a handoff was asked for: continue it.
+    if (flow.then) {
+      res.writeHead(303, { location: `/try/handoff-out?${new URLSearchParams({ client_id: flow.clientId, ...flow.then })}` }).end();
+      return;
+    }
     return tryRedirect(res, flow.clientId);
   }
   if (url.pathname === '/try/me') {
@@ -862,8 +879,10 @@ async function consoleRoute(req: IncomingMessage, res: ServerResponse) {
     const target = url.searchParams.get('target') ?? '';
     const path = url.searchParams.get('path') ?? '/dashboard';
     if (!B!.trySessions.has(clientId)) {
-      tryEvent(B!, clientId, 'Handoff refused: sign in to this app first (a source needs a local session)', false);
-      return tryRedirect(res, clientId);
+      // No local session on the source: sign in first, then continue this handoff from the callback.
+      tryEvent(B!, clientId, `Handoff to ${target} ${path}: no local session - signing in first, the handoff continues after sign-in`);
+      res.writeHead(303, { location: `/try/login?${new URLSearchParams({ client_id: clientId, then_target: target, then_path: path })}` }).end();
+      return;
     }
     const r = await handoffRequest(tryBasic(clientId), target, path);
     if (!r.url) {
@@ -921,7 +940,7 @@ const TRY_REDIRECT = `${PUBLIC_URL}/try/callback`;
 const TRY_LOGGED_OUT = `${PUBLIC_URL}/try/logged-out`;
 /** Secrets of clients registered / rotated in this console session (memory only, dev convenience). */
 const trySecrets = new Map<string, string>();
-const tryPending = new Map<string, { clientId: string; verifier: string; nonce: string }>();
+const tryPending = new Map<string, { clientId: string; verifier: string; nonce: string; then?: { target: string; path: string } }>();
 const tryLogoutState = new Map<string, string>();
 function tryEvent(b: BrowserState, clientId: string, text: string, ok = true) {
   const list = b.tryEvents.get(clientId) ?? [];
