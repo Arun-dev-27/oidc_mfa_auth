@@ -32,7 +32,8 @@
     "client:add-uri": "ts-node -r tsconfig-paths/register scripts/client-add-uri.ts",
     "client:handoff": "ts-node -r tsconfig-paths/register scripts/client-handoff.ts",
     "client:rotate-secret": "ts-node -r tsconfig-paths/register scripts/client-rotate-secret.ts",
-    "seed:dev-db": "ts-node -r tsconfig-paths/register scripts/seed-dev-db.ts"
+    "seed:dev-db": "ts-node -r tsconfig-paths/register scripts/seed-dev-db.ts",
+    "email:test": "ts-node -r tsconfig-paths/register scripts/email-test.ts"
   },
   "dependencies": {
     "@aws-sdk/client-kms": "^3.1139.0",
