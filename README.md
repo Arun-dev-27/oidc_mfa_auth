@@ -18,7 +18,7 @@ permissions) stays in each Business Unit.
 | Authorization Code + PKCE S256 | Enforced by `oidc-provider`; implicit flow and plain PKCE are off |
 | MFA owned by Core | OTP by **Email (default)** / SMS through adapters, or TOTP; reused only in the same realm session while fresh |
 | Tokens | RS256 ID token, audience = the one client, `acr`, `amr`, `auth_time`, `auth_realm`, `sid` |
-| JWKS | `/.well-known/jwks.json`, public keys only, rotation NEXT → ACTIVE → RETIRING → RETIRED, emergency revoke, AWS KMS signing |
+| JWKS | `/.well-known/jwks.json`, public keys only, rotation NEXT → ACTIVE → RETIRING → RETIRED, emergency revoke; private key set in AWS SSM Parameter Store or a local file (`KEY_PROVIDER=auto/ssm/file`) |
 
 ## Endpoints
 
@@ -61,7 +61,7 @@ src/
     identity/                  CredentialService (legacy password decrypt, status, allow_login, eligibility)
     sessions/                  GlobalSessionService (realm cookie, Redis hot copy + auth_sessions)
     mfa/                       MfaService, TOTP, adapters/{email,sms}-otp.adapter.ts + registry
-    keys/                      SigningKeyService (file or AWS KMS via ExternalSigningKey) + metadata sync
+    keys/                      SigningKeyService + SigningKeyProvider (auto / SSM / file; legacy KMS) + metadata sync
     oidc/                      provider.factory.ts, Redis adapter, client registry, sign-in (interaction) service/controller, signin-paths.ts
     views/                     tiny SSR template renderer
     security/ audit/ health/
@@ -126,8 +126,10 @@ Allow-login and eligibility messages are only shown after a correct password.
 ```bash
 cp .env.example .env            # fill DB_*, secrets (see comments); dev: EMAIL_TRANSPORT=outbox
 npm install
+npm run db:create-missing-tables  # DEV ONLY, dry run: lists tables missing from DB_SCHEMA
+npm run db:create-missing-tables -- --yes   # creates ONLY the missing tables (empty; no users, no data)
 npm run migration:run           # schema only - see above
-npm run keys -- generate        # RS256 signing key (file provider) -> .keys/signing-keys.json
+npm run keys -- generate        # RS256 signing key; no AWS credentials -> .keys/signing-keys.json (KEY_PROVIDER=auto)
 npm run client:register -- --client-id rms-admin-dev --name "RMS Admin" --realm ADMIN \
   --redirect http://localhost:5173/auth/callback --auth-method client_secret_basic --business-unit RMS
 npm run build && npm start      # http://localhost:4000
@@ -198,7 +200,7 @@ equivalent at `/token` (the handoff API still enforces the registered method).
 | Image | `docker/Dockerfile.dev` (all deps, hot reload) | `docker/Dockerfile.prod` (multi-stage, compiled JS + prod deps only, no TypeScript / ts-node / Nest CLI) |
 | Compose | `docker-compose.dev.yml` | `docker-compose.prod.yml` |
 | Settings | `.env` (DB / Redis pointed at `host.docker.internal`) | `.env.production` (copy `.env.production.example`) |
-| Signing keys | `.keys/` bind mount (file provider) | AWS KMS (enforced) |
+| Signing keys | `.keys/` bind mount (auto -> file) | AWS SSM Parameter Store (file refused) |
 | Email / SMS | outbox → `./.outbox` | SMTP / SMS gateway (outbox refused) |
 | Hardening | — | non-root `node`, read-only root FS, `cap_drop: ALL`, `no-new-privileges`, healthcheck on `/health/ready`, bound to 127.0.0.1 behind an HTTPS proxy |
 
@@ -215,7 +217,7 @@ docker compose -f docker-compose.prod.yml up -d --build
 ```
 
 The production container refuses to start (exit 1, every problem listed) with unsafe settings: http
-issuer, insecure cookies, outbox transports, signing keys outside KMS or a custom AWS endpoint.
+issuer, insecure cookies, outbox transports, signing keys from a local file or a custom AWS endpoint.
 
 ## Logout (realm-wide)
 
@@ -232,7 +234,7 @@ issuer, insecure cookies, outbox transports, signing keys outside KMS or a custo
 
 **Back-channel message**: `POST <client BACK_CHANNEL_LOGOUT uri>`, form field `logout_token` = RS256 JWS,
 `typ: miqaat-logout+jwt`, claims `iss aud sub sid auth_realm reason iat exp(+120 s) jti events`, signed
-with the Core key (file or KMS). The BU verifies it with the JWKS, de-duplicates `jti` and ends every local
+with the Core key (from SSM, the local file or KMS). The BU verifies it with the JWKS, de-duplicates `jti` and ends every local
 session with that `sid`.
 
 **Delivery** (`logout_jobs`, `logout_deliveries`): durable PostgreSQL queue, `FOR UPDATE SKIP LOCKED` (safe
@@ -280,77 +282,55 @@ Settings: `HANDOFF_REQUEST_TTL_SECONDS` (90), `HANDOFF_ASSERTION_TTL_SECONDS` (6
 `HANDOFF_RATE_LIMIT_PER_MINUTE` (60 per source client). Audit events: `HANDOFF_REQUESTED`,
 `HANDOFF_REJECTED`, `HANDOFF_COMPLETED`, `HANDOFF_CANCELLED`.
 
-## Signing keys: file (dev) or AWS KMS (production)
+## Signing keys: SSM Parameter Store (AWS) or local file (development)
 
-`SIGNING_KEY_PROVIDER=kms` (enforced in production) signs every token inside AWS KMS through
-oidc-provider's `ExternalSigningKey`: the private key never leaves KMS, only the public JWK is kept
-in `signing_key_metadata` (`key_provider_ref = kms:<KeyId>`). The service self-tests a KMS signature
-at start-up and refuses to start when it fails.
+Tokens are signed in this process with RS256. Only **where the private key set is stored** changes,
+chosen by `KEY_PROVIDER` through one provider abstraction (`src/modules/keys/*signing-key-provider.ts`):
+
+```text
+KEY_PROVIDER=auto (default)
+        |
+        +-- AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY set -> AWS SSM Parameter Store (SecureString SSM_SIGNING_KEYS_PARAMETER)
+        |
+        +-- not set                                        -> local file (SIGNING_KEYS_FILE, git-ignored)
+KEY_PROVIDER=ssm   -> always SSM          KEY_PROVIDER=file -> always the file (refused in production)
+KEY_PROVIDER=kms   -> legacy: keys inside AWS KMS, signed with KMS Sign
+```
+
+* The stored value is the same JSON in both stores: `{"keys":[{"status":"ACTIVE","jwk":{...private RS256 JWK, kid...}}]}`,
+  so the rotation lifecycle below works unchanged. In SSM, RETIRED / revoked keys keep only their public JWK.
+* AWS credentials come ONLY from the environment variables `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`
+  (+ `AWS_SESSION_TOKEN`) and `AWS_REGION`; `~/.aws` files, SSO and roles are never read
+  (`AWS_CREDENTIALS_SOURCE=env`, the default). `AWS_CREDENTIALS_SOURCE=chain` opts in to the full AWS
+  default chain (profiles, SSO, ECS / EC2 IAM role). Outside production,
+  if credentials exist but SSM cannot be read, it logs a warning and uses the local file; production never
+  falls back and never accepts a file.
+* The legacy `SIGNING_KEY_PROVIDER=file|kms` is still honoured when `KEY_PROVIDER` is not set.
+* The SSM path defaults to `/miqaatcoredev/<dev|test|prod>/auth/jwks-private-key` (from `NODE_ENV`).
+  `npm run keys -- list` only reads; other commands write the parameter.
+* IAM: the service needs `ssm:GetParameter` on the parameter (plus `kms:Decrypt` with `SSM_KMS_KEY_ID`);
+  the keys CLI also needs `ssm:PutParameter`.
 
 ```bash
-npm run keys -- list
+npm run keys -- list                     # prints "key provider: ssm:/... | file:..." first
 npm run keys -- generate                 # ACTIVE if none, else NEXT (prepublished in JWKS, not signing)
 npm run keys -- activate <kid>           # NEXT -> ACTIVE, old ACTIVE -> RETIRING (still published)
 npm run keys -- retire <kid>             # RETIRING -> RETIRED (removed from JWKS)
 npm run keys -- revoke <kid> [--revoke-sessions]
                                          # EMERGENCY: removed from JWKS at once, never signs again,
-                                         # NEXT promoted or a new key created; KMS key scheduled for deletion;
+                                         # NEXT promoted or a new key created; (kms: key scheduled for deletion);
                                          # --revoke-sessions ends every active Core session (DB + Redis)
+KEY_PROVIDER=ssm  npm run keys -- generate   # write to SSM explicitly
+KEY_PROVIDER=file npm run keys -- generate   # write to the local file explicitly
 ```
 
-Restart / roll the service after each change. Normal rotation: generate → wait ≥ JWKS cache time →
-activate → wait max token lifetime + skew → retire.
-
-## Legacy password cipher
-
-`src/modules/identity/legacy-password-cipher.ts` holds `decrypt` (byte-for-byte port of the C# code)
-and `encrypt`, its exact inverse (random printable key half, self-checked). This service only reads
-`users.password`; `encrypt` is for the owning system and test data.
-
-```bash
-npm run password -- encrypt --value 'Secret@123'          # ciphertext accepted by the legacy Decrypt()
-npm run password -- verify --its 10110101 --value '...'    # MATCH / NO MATCH against users.password
-npm run password -- roundtrip                              # decrypt -> encrypt -> decrypt every stored password
-```
-
-## Test Console (browser UI, development only)
-
-```bash
-npm run build && npm start      # terminal 1: the service on :4000
-npm run console                  # terminal 2: http://localhost:5170
-```
-
-One page with three demo Business Unit apps (RMS Admin :5173, AMS Admin :5174, RMS Mumin :5175) that
-sign in through Core (PKCE, token exchange, JWKS verification, /me), plus live panels: OTP codes from
-the dev outbox, test members (status, eligibility, MFA methods, passwords), Core sessions, the audit
-trail, service health / signing keys, logout deliveries, handoff requests and a scenario checklist.
-Each card has **Open via handoff** (target app + path): the card acts as the source backend, Core
-delivers the assertion to the target app, which verifies it and opens the page (`/admin/*` is denied by
-the demo target authorization; a MUMIN target is refused by Core with `REALM_MISMATCH`). Client secrets are read from
-`.e2e-<app>.txt`. Refuses to run with NODE_ENV=production.
-
-**Client registration** panel (`http://localhost:5170/#clients`) — the UI form of `npm run client:register`
-(both use `scripts/lib/client-admin.ts`, so the rules are identical):
-
-* Form: client ID, name, realm, environment, business unit, default assurance, redirect / post-logout /
-  back-channel URIs, scopes, client authentication (`client_secret_basic` standard; `private_key_jwt` with a
-  JWKS URI or public JWKS) and optional trusted handoff (start / receive, callback URI, allowed paths).
-* On success the **secret is shown once**, with the exact `Authorization: Basic …` header the app must send.
-  Errors (invalid ID, realm, non-https or wildcard URIs, duplicate client, missing handoff callback …) are
-  shown in the page and nothing is written.
-* Registered clients table: realm, method, status, URIs, handoff, whether Core can use it (and why not),
-  and actions **Open test app**, **New secret** (rotation, old secret stops at once) and **Suspend / Activate**.
-* **Use console test URLs** points the new client's redirect, post-logout, back-channel and handoff URIs at
-  the console's **test app** (`/try?client_id=…`), which then plays that client's backend: Sign in (AAL1),
-  Sign in + MFA (AAL2 step-up), Call `/me`, Logout (realm-wide, its back-channel logout is received and
-  verified), handoff **out** to a demo app and handoff **in** from a demo app, with a log of every step.
-* The API behind it only accepts JSON requests from the console page (custom header + Origin check), so
-  another web site cannot register clients through your browser. There is no delete.
+The keys CLI uses the same provider as the service (and never falls back), so a key is always written to
+the store the service will read. Restart (or roll) the service after every key change.
 
 ## Hosted test environment (Render)
 
 A **test / demo** deployment (development mode: static test OTP, outbox mail, file signing key — not the
-production setup, which needs KMS and a real mail / SMS provider):
+production setup, which needs keys in SSM and a real mail / SMS provider):
 
 | Render resource | What |
 |---|---|
@@ -421,12 +401,12 @@ client authentication (`client_secret_basic` standard: no credentials, secret in
 wrong key; secret rotation: old secret refused at once, new secret works); `/me`; CSRF, Origin, security headers and cookie
 flags; session cookie rotation; idle and absolute expiry; Redis loss (rebuild from PostgreSQL); SMS
 HTTP gateway (success + outage); key rotation NEXT → ACTIVE → RETIRING → RETIRED; emergency revoke
-with session revocation; KMS signing, rotation and revoke on LocalStack; audit events, hashed OTPs and
+with session revocation; KMS signing, rotation and revoke on LocalStack; SSM key provider, rotation and KEY_PROVIDER=auto (with and without AWS credentials) on LocalStack; audit events, hashed OTPs and
 no OTP / password in logs; realm logout with back-channel delivery and retries; trusted handoff
 (Basic source authentication, other methods refused, assertion claims / JWKS / 60 s, one-time URL, expiry,
 login and aal:2 step-up on the handoff, cancel, cross-realm and unsafe paths, inbound / outbound
 disabled, participant recorded and notified on logout). It resets only its own `e2e-*` clients and the auth rows of the fixed test
-ITS IDs; synced tables are only read. KMS checks need LocalStack on `http://localhost:4566`.
+ITS IDs; synced tables are only read. KMS and SSM checks need LocalStack on `http://localhost:4566`.
 
 ## Out of scope / still open
 

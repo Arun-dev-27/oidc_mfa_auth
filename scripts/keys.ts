@@ -1,9 +1,14 @@
 /**
- * Signing key lifecycle (spec §24-25), for SIGNING_KEY_PROVIDER=file or kms.
+ * Signing key lifecycle (spec §24-25). The key set is read and written through the same provider the
+ * service uses (KEY_PROVIDER):
+ *   auto  AWS credentials available -> SSM Parameter Store, otherwise the local file
+ *   ssm   SecureString at SSM_SIGNING_KEYS_PARAMETER
+ *   file  SIGNING_KEYS_FILE
+ *   kms   legacy: keys inside AWS KMS + signing_key_metadata
  *
  *   npm run keys -- list
  *   npm run keys -- generate                 new key: ACTIVE when none is active, else NEXT (prepublished)
- *                                            file: RSA 2048 JWK in SIGNING_KEYS_FILE
+ *                                            auto / ssm / file: RSA 2048 private JWK added to the key set
  *                                            kms:  CreateKey(RSA_2048, SIGN_VERIFY) + metadata row
  *   npm run keys -- activate <kid>           rotation: NEXT -> ACTIVE, previous ACTIVE -> RETIRING
  *   npm run keys -- retire <kid>             RETIRING -> RETIRED (removed from JWKS)
@@ -18,14 +23,15 @@
 import 'reflect-metadata';
 import { CreateKeyCommand, GetPublicKeyCommand, ScheduleKeyDeletionCommand } from '@aws-sdk/client-kms';
 import { createPublicKey, randomBytes } from 'node:crypto';
-import { resolve } from 'node:path';
 import Redis from 'ioredis';
 import { calculateJwkThumbprint, exportJWK, generateKeyPair, type JWK } from 'jose';
 import { loadDotEnv, parseEnv, type Env } from '../src/config/env';
 import AppDataSource from '../src/database/data-source';
 import { SigningKeyMetadata, type SigningKeyStatus } from '../src/database/entities';
 import { SigningKeyRepository } from '../src/database/repositories/signing-key.repository';
-import { readKeyFile, writeKeyFile, type StoredSigningKey } from '../src/modules/keys/key-file';
+import { AutoSigningKeyProvider } from '../src/modules/keys/auto-signing-key-provider';
+import { createSigningKeyProvider } from '../src/modules/keys/create-signing-key-provider';
+import type { StoredSigningKey } from '../src/modules/keys/key-file';
 import { createKmsClient } from '../src/modules/keys/kms-signing-key';
 import { parseArgs } from './cli-args';
 
@@ -53,9 +59,14 @@ interface KeyStore {
   save(): Promise<void>;
 }
 
-async function fileStore(): Promise<KeyStore> {
-  const path = resolve(env.SIGNING_KEYS_FILE);
-  const file = await readKeyFile(path, { allowMissing: true });
+/** Key set in SSM or a local file, through the SigningKeyProvider (the same one the service loads). */
+async function keySetStore(): Promise<KeyStore> {
+  const provider = createSigningKeyProvider(env, { fallbackOnSsmError: false, log: (m) => console.log(m) });
+  if (provider instanceof AutoSigningKeyProvider) await provider.resolve();
+  const file = await provider.getSigningKeys({ allowMissing: true });
+  console.log(`key provider: ${provider.describe()}`);
+  // Only a real change is written back ("list" is read-only: no write, no ssm:PutParameter needed).
+  let changed = false;
   const find = (kid: string) => {
     const k = file.keys.find((x) => x.jwk.kid === kid);
     if (!k) throw new Error(`unknown kid ${kid}`);
@@ -70,16 +81,19 @@ async function fileStore(): Promise<KeyStore> {
       const kid = newKid();
       const jwk = { ...(await exportJWK(privateKey)), kid, alg: 'RS256', use: 'sig' } as StoredSigningKey['jwk'];
       file.keys.push({ status, jwk });
+      changed = true;
       return kid;
     },
     async setStatus(kid, status, revoked) {
       const k = find(kid);
       k.status = status;
       if (revoked) k.revokedAt = new Date().toISOString();
+      changed = true;
     },
     async save() {
-      await writeKeyFile(path, file);
-      console.log(`written ${path}`);
+      if (!changed) return;
+      await provider.saveSigningKeys(file);
+      console.log(`written ${provider.describe()}`);
     },
   };
 }
@@ -154,7 +168,7 @@ async function revokeAllSessions(e: Env): Promise<number> {
 }
 
 async function main() {
-  const store = env.SIGNING_KEY_PROVIDER === 'kms' ? await kmsStore() : await fileStore();
+  const store = env.KEY_PROVIDER === 'kms' ? await kmsStore() : await keySetStore();
   const keys = await store.list();
   const need = (kid: string | undefined) => {
     const k = keys.find((x) => x.kid === kid);

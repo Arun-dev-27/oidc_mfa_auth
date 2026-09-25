@@ -9,7 +9,8 @@
 #
 # Reads .env (same file as running without Docker). "localhost" inside a container is the
 # container itself, so the database / Redis / LocalStack hosts are pointed at the Docker host.
-# Keys (.keys) and the Email/SMS outbox (.outbox) are shared with the host folder.
+# Keys (.keys) and the Email/SMS outbox (.outbox) are shared with the host folder. With
+# KEY_PROVIDER=auto and no AWS credentials in the container, the key set is read from .keys/.
 # -----------------------------------------------------------------------------------------------
 name: oidc-mfa-auth-dev
 

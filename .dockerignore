@@ -11,3 +11,5 @@ coverage
 .e2e
 .e2e*
 *.tsbuildinfo
+config/keys
+*.pem

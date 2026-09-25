@@ -7,9 +7,10 @@
 #
 # Put an HTTPS reverse proxy / load balancer in front (ISSUER must be https) and set TRUST_PROXY
 # to the number of proxy hops. The service refuses to start with unsafe production settings
-# (http issuer, insecure cookies, outbox transports, signing keys outside KMS, custom AWS endpoint).
-# Signing keys live in AWS KMS: give the container an IAM role / credentials allowed to
-# kms:Sign + kms:GetPublicKey on the signing keys.
+# (http issuer, insecure cookies, outbox transports, signing keys from a local file, custom AWS endpoint).
+# Signing keys: KEY_PROVIDER=ssm (or auto) loads the private key set from the SSM SecureString
+# SSM_SIGNING_KEYS_PARAMETER. Give the container an IAM role allowed to ssm:GetParameter on that
+# parameter (+ kms:Decrypt when SSM_KMS_KEY_ID is a customer key). No key file is mounted.
 # -----------------------------------------------------------------------------------------------
 name: oidc-mfa-auth
 

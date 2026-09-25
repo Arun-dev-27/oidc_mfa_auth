@@ -4,8 +4,8 @@
 #   * multi-stage: compiled JavaScript + production dependencies only (no TypeScript, no dev tools)
 #   * runs as the unprivileged "node" user, read-only friendly (only the Email/SMS outbox would
 #     write, and the outbox is refused in production)
-#   * signing keys come from AWS KMS (SIGNING_KEY_PROVIDER=kms is enforced when NODE_ENV=production);
-#     no key file is ever baked into the image
+#   * signing keys come from AWS SSM Parameter Store (KEY_PROVIDER=ssm / auto; a local key file is
+#     refused when NODE_ENV=production); no key file is ever baked into the image
 #   * schema changes: run the one-shot `migrate` service of docker-compose.prod.yml
 # ---------------------------------------------------------------------------------------------
 

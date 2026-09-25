@@ -7,3 +7,6 @@ dist/
 coverage/
 .e2e*
 .env.production
+# Private signing key sets (KEY_PROVIDER=file / auto without AWS) - never commit
+config/keys/
+*.pem

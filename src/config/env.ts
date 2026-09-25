@@ -113,9 +113,33 @@ export const envSchema = z
     HANDOFF_RATE_LIMIT_PER_MINUTE: int(60, 1),
 
     // --- Signing keys -----------------------------------------------------------------------
-    /** file: private JWKs in SIGNING_KEYS_FILE (development). kms: AWS KMS keys listed in signing_key_metadata. */
-    SIGNING_KEY_PROVIDER: z.enum(['file', 'kms']).default('file'),
+    /**
+     * Where the private signing key set (RS256 JWKs + rotation status) is stored and loaded from:
+     *   auto  AWS credentials available -> SSM Parameter Store, otherwise the local file (default)
+     *   ssm   SSM Parameter Store (SecureString at SSM_SIGNING_KEYS_PARAMETER)
+     *   file  local file at SIGNING_KEYS_FILE (development; refused in production)
+     *   kms   legacy: keys inside AWS KMS, signed with KMS Sign (listed in signing_key_metadata)
+     * Unset -> the legacy SIGNING_KEY_PROVIDER value, else auto.
+     */
+    KEY_PROVIDER: z.enum(['auto', 'ssm', 'file', 'kms']).optional(),
+    /** Legacy name of KEY_PROVIDER (file | kms), still honoured when KEY_PROVIDER is not set. */
+    SIGNING_KEY_PROVIDER: z.enum(['file', 'kms']).optional(),
     SIGNING_KEYS_FILE: z.string().default('./.keys/signing-keys.json'),
+    /** SSM parameter (SecureString) holding the key set. Empty -> /miqaatcoredev/<dev|test|prod>/auth/jwks-private-key. */
+    SSM_SIGNING_KEYS_PARAMETER: z
+      .string()
+      .default('')
+      .refine((v) => v === '' || /^\/[A-Za-z0-9_.\-/]{1,1010}$/.test(v), 'SSM_SIGNING_KEYS_PARAMETER: an absolute parameter path such as /miqaatcoredev/prod/auth/jwks-private-key'),
+    /** KMS key (id, ARN or alias) that encrypts the SecureString; empty -> the AWS managed key aws/ssm. Encryption only, never signing. */
+    SSM_KMS_KEY_ID: z.string().default(''),
+    /**
+     * Where the SSM client takes AWS credentials from:
+     *   env    ONLY AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (+ AWS_SESSION_TOKEN) - no ~/.aws files, no roles (default)
+     *   chain  the full AWS default chain (env, AWS_PROFILE / ~/.aws, SSO, web identity, ECS / EC2 role)
+     */
+    AWS_CREDENTIALS_SOURCE: z.enum(['env', 'chain']).default('env'),
+    /** How long KEY_PROVIDER=auto waits for AWS credentials before choosing the local file. */
+    KEY_PROVIDER_DETECT_TIMEOUT_MS: int(3000, 200),
     AWS_REGION: z.string().default('ap-south-1'),
     /** LocalStack / custom endpoint for development only; refused in production. */
     AWS_ENDPOINT_URL: z.union([z.string().url(), z.literal('')]).default(''),
@@ -199,7 +223,9 @@ export const envSchema = z
       if (!env.ISSUER.startsWith('https://')) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['ISSUER'], message: 'must be https in production' });
       if (env.EMAIL_TRANSPORT === 'outbox') ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['EMAIL_TRANSPORT'], message: 'outbox is for development only' });
       if (env.SMS_TRANSPORT === 'outbox') ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['SMS_TRANSPORT'], message: 'outbox is for development only' });
-      if (env.SIGNING_KEY_PROVIDER !== 'kms') ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['SIGNING_KEY_PROVIDER'], message: 'production signing keys must live in KMS (SIGNING_KEY_PROVIDER=kms)' });
+      if (resolvedKeyProvider(env) === 'file') {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['KEY_PROVIDER'], message: 'production signing keys must not come from a local file (KEY_PROVIDER=ssm or auto with AWS credentials)' });
+      }
       if (env.AWS_ENDPOINT_URL) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['AWS_ENDPOINT_URL'], message: 'must be empty in production' });
       if (env.MFA_STATIC_OTP) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['MFA_STATIC_OTP'], message: 'a static OTP is for testing only and must be empty in production' });
     }
@@ -212,9 +238,25 @@ export const envSchema = z
     if (env.SMS_TRANSPORT === 'http' && !env.SMS_HTTP_URL) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['SMS_HTTP_URL'], message: 'required when SMS_TRANSPORT=http' });
     }
-  });
+  })
+  // Effective key provider and SSM parameter, so the rest of the code reads one value.
+  .transform((env) => ({
+    ...env,
+    KEY_PROVIDER: resolvedKeyProvider(env),
+    SSM_SIGNING_KEYS_PARAMETER: env.SSM_SIGNING_KEYS_PARAMETER || `/miqaatcoredev/${stageOf(env.NODE_ENV)}/auth/jwks-private-key`,
+  }));
 
 export type Env = z.infer<typeof envSchema>;
+export type KeyProviderSetting = Env['KEY_PROVIDER'];
+
+/** KEY_PROVIDER, else the legacy SIGNING_KEY_PROVIDER, else auto. */
+function resolvedKeyProvider(env: { KEY_PROVIDER?: 'auto' | 'ssm' | 'file' | 'kms'; SIGNING_KEY_PROVIDER?: 'file' | 'kms' }) {
+  return env.KEY_PROVIDER ?? env.SIGNING_KEY_PROVIDER ?? 'auto';
+}
+
+function stageOf(nodeEnv: string): string {
+  return ({ production: 'prod', test: 'test' } as Record<string, string>)[nodeEnv] ?? 'dev';
+}
 
 /** Loads a .env file (if present) without overriding variables already set by the environment. */
 export function loadDotEnv(path = '.env'): void {

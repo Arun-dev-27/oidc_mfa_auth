@@ -19,6 +19,7 @@ import { randomBytes } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { readdir, readFile, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { GetParameterCommand, SSMClient } from '@aws-sdk/client-ssm';
 import Redis from 'ioredis';
 import { createLocalJWKSet, decodeJwt, decodeProtectedHeader, exportJWK, generateKeyPair, jwtVerify, type JWK } from 'jose';
 import { encryptString, toKey32 } from '../src/common/crypto.util';
@@ -411,6 +412,8 @@ const BASE: Record<string, string> = {
   MFA_REQUIRED_FOR_ALL: 'false',
   // A local .env may enable the testing static OTP; the suite switches it on only in its own profile.
   MFA_STATIC_OTP: '',
+  // Deterministic key source: a developer machine may have AWS credentials (KEY_PROVIDER=auto -> SSM).
+  KEY_PROVIDER: 'file',
 };
 
 let server: RunningServer | null = null;
@@ -948,7 +951,7 @@ async function main() {
   smsSource = async (since) => (await outboxCode('sms', since)).code;
 
   // ------------------------------------------------------------------------------------------------
-  const rotation = { SIGNING_KEYS_FILE: './.e2e/rotation-keys.json' };
+  const rotation = { KEY_PROVIDER: 'file', SIGNING_KEYS_FILE: './.e2e/rotation-keys.json' };
   await rm(resolve(rotation.SIGNING_KEYS_FILE), { force: true });
   const kidsOf = (text: string) => [...text.matchAll(/^(\S+)\t(\w+)/gm)].map((m) => ({ kid: m[1], status: m[2] }));
   const loginKid = async (client: TestClient, b = new Browser()) => {
@@ -1017,7 +1020,7 @@ async function main() {
 
   // ------------------------------------------------------------------------------------------------
   const kmsEnv = {
-    SIGNING_KEY_PROVIDER: 'kms',
+    KEY_PROVIDER: 'kms',
     AWS_ENDPOINT_URL: process.env.E2E_KMS_ENDPOINT ?? 'http://localhost:4566',
     AWS_ACCESS_KEY_ID: 'test',
     AWS_SECRET_ACCESS_KEY: 'test',
@@ -1056,6 +1059,96 @@ async function main() {
       await scenario('kms revoke', async () => {
         const jwks = await fetchJwks();
         check('revoked KMS key removed, emergency KMS key active', /created emergency key/.test(revoked) && !jwks.keys.some((k) => k.kid === next) && (await loginKid(clients.admin)).kid === emergency);
+      });
+    });
+  }
+
+  // ------------------------------------------------------------------------------------------------
+  // Key-set providers: SSM Parameter Store (LocalStack) and KEY_PROVIDER=auto in both directions.
+  const ssmParam = `/miqaatcoredev/test/auth/jwks-private-key-e2e-${Date.now()}`;
+  const ssmEnv = {
+    KEY_PROVIDER: 'ssm',
+    SSM_SIGNING_KEYS_PARAMETER: ssmParam,
+    AWS_ENDPOINT_URL: kmsEnv.AWS_ENDPOINT_URL,
+    AWS_ACCESS_KEY_ID: 'test',
+    AWS_SECRET_ACCESS_KEY: 'test',
+    AWS_REGION: kmsEnv.AWS_REGION,
+    SIGNING_KEYS_FILE: './.e2e/ssm-must-not-use-this-file.json',
+  };
+  if (!kmsUp) {
+    group = '11d. SSM key provider (LocalStack)';
+    console.log(`\n=== ${group}`);
+    check('LocalStack SSM reachable', false, `${kmsEnv.AWS_ENDPOINT_URL} is not reachable (docker start miqaat-authn-localstack)`);
+  } else {
+    await rm(resolve(ssmEnv.SIGNING_KEYS_FILE), { force: true });
+    const ssm = new SSMClient({ region: ssmEnv.AWS_REGION, endpoint: ssmEnv.AWS_ENDPOINT_URL, credentials: { accessKeyId: 'test', secretAccessKey: 'test' } });
+    const storedSet = async () => {
+      const out = await ssm.send(new GetParameterCommand({ Name: ssmParam, WithDecryption: true }));
+      return { type: out.Parameter?.Type, set: JSON.parse(out.Parameter?.Value ?? '{"keys":[]}') as { keys: { status: string; jwk: Record<string, unknown> }[] } };
+    };
+    const genOut = keysCli(ssmEnv, 'generate');
+    const ssmKid1 = genOut.match(/generated (\S+)/)?.[1] ?? '';
+    await profile('11d. SSM key provider (LocalStack)', ssmEnv, async () => {
+      await scenario('ssm generate + sign', async () => {
+        check('keys generate (KEY_PROVIDER=ssm) wrote the key set to the SSM parameter', genOut.includes(`key provider: ssm:${ssmParam}`) && Boolean(ssmKid1), genOut.slice(0, 200));
+        const { type, set } = await storedSet();
+        check('parameter is a SecureString holding the private JWK + status', type === 'SecureString' && set.keys.length === 1 && set.keys[0].status === 'ACTIVE' && 'd' in set.keys[0].jwk);
+        const onDisk = await readFile(resolve(ssmEnv.SIGNING_KEYS_FILE), 'utf8').then(() => true).catch(() => false);
+        check('no local key file was created', !onDisk);
+        const jwks = await fetchJwks();
+        check('JWKS publishes the SSM key, public members only', jwks.keys.some((k) => k.kid === ssmKid1) && jwks.keys.every((k) => !('d' in k)));
+        const t = await loginKid(clients.admin);
+        check('ID token signed (RS256, in process) with the key loaded from SSM', t.kid === ssmKid1);
+        const [meta] = await AppDataSource.query('SELECT key_provider_ref FROM signing_key_metadata WHERE kid = $1', [ssmKid1]);
+        check('signing_key_metadata.key_provider_ref = ssm:<parameter>', meta?.key_provider_ref === `ssm:${ssmParam}`, meta?.key_provider_ref);
+      });
+    });
+    keysCli(ssmEnv, 'generate');
+    const ssmKid2 = kidsOf(keysCli(ssmEnv, 'list')).find((k) => k.status === 'NEXT')?.kid ?? '';
+    keysCli(ssmEnv, 'activate', ssmKid2);
+    await profile('11e. SSM key rotation', ssmEnv, async () => {
+      await scenario('ssm rotate', async () => {
+        const t = await loginKid(clients.admin);
+        const jwks = await fetchJwks();
+        check('after activate, tokens signed by the new SSM key; old one still published (RETIRING)', t.kid === ssmKid2 && jwks.keys.some((k) => k.kid === ssmKid1));
+      });
+    });
+    keysCli(ssmEnv, 'retire', ssmKid1);
+    const afterRetire = (await storedSet()).set.keys;
+    const retired = afterRetire.find((k) => k.jwk.kid === ssmKid1);
+    const activeNow = afterRetire.find((k) => k.jwk.kid === ssmKid2);
+    await profile('11f. KEY_PROVIDER=auto with AWS credentials -> SSM', { ...ssmEnv, KEY_PROVIDER: 'auto' }, async () => {
+      await scenario('auto -> ssm', async () => {
+        check('retired key kept in SSM without private material; ACTIVE key keeps it', retired?.status === 'RETIRED' && !('d' in (retired?.jwk ?? {})) && Boolean(activeNow && 'd' in activeNow.jwk));
+        const jwks = await fetchJwks();
+        check('auto picked SSM: JWKS = the SSM key set (retired key gone)', jwks.keys.some((k) => k.kid === ssmKid2) && !jwks.keys.some((k) => k.kid === ssmKid1));
+        check('auto picked SSM: tokens signed by the SSM ACTIVE key', (await loginKid(clients.admin)).kid === ssmKid2);
+        const log = await readFile(resolve('.e2e/logs/11f-key-provider-auto-with-aws-credentials-ssm.log'), 'utf8').catch(() => '');
+        check('start-up log says AWS credentials found -> ssm', /KEY_PROVIDER=auto: AWS credentials found -> ssm:/.test(log));
+      });
+    });
+    // No credentials at all: env, profile files, metadata service all unavailable.
+    const noAws = {
+      ...rotation,
+      KEY_PROVIDER: 'auto',
+      AWS_ENDPOINT_URL: '',
+      AWS_ACCESS_KEY_ID: '',
+      AWS_SECRET_ACCESS_KEY: '',
+      AWS_SESSION_TOKEN: '',
+      AWS_PROFILE: '',
+      AWS_SHARED_CREDENTIALS_FILE: resolve('.e2e/no-aws-credentials'),
+      AWS_CONFIG_FILE: resolve('.e2e/no-aws-config'),
+      AWS_EC2_METADATA_DISABLED: 'true',
+      KEY_PROVIDER_DETECT_TIMEOUT_MS: '1500',
+    };
+    const fileActive = kidsOf(keysCli(rotation, 'list')).find((k) => k.status === 'ACTIVE')?.kid ?? '';
+    const autoList = keysCli(noAws, 'list');
+    await profile('11g. KEY_PROVIDER=auto without AWS credentials -> local file', noAws, async () => {
+      await scenario('auto -> file', async () => {
+        check('keys CLI with auto and no credentials uses the local file', autoList.includes(`key provider: file:${rotation.SIGNING_KEYS_FILE}`), autoList.slice(0, 200));
+        check('service starts without AWS credentials and signs with the file key', (await loginKid(clients.admin)).kid === fileActive && Boolean(fileActive));
+        const log = await readFile(resolve('.e2e/logs/11g-key-provider-auto-without-aws-credentials-local-file.log'), 'utf8').catch(() => '');
+        check('start-up log says no AWS credentials -> file', /KEY_PROVIDER=auto: no AWS credentials .*-> file:/.test(log));
       });
     });
   }

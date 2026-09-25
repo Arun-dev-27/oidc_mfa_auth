@@ -1,12 +1,16 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { createPrivateKey, sign as cryptoSign } from 'node:crypto';
 import { calculateJwkThumbprint, type JWK } from 'jose';
 import type { ExternalSigningKey } from 'oidc-provider';
 import { AppConfig } from '../../config/config.module';
 import type { SigningKeyStatus } from '../../database/entities';
 import { SigningKeyRepository } from '../../database/repositories/signing-key.repository';
-import { readKeyFile, toPublicJwk } from './key-file';
+import { toPublicJwk } from './key-file';
 import { createKmsClient, KmsSigningKey } from './kms-signing-key';
+import type { SigningKeyProvider } from './signing-key-provider';
+
+/** Nest token of the configured SigningKeyProvider (null for KEY_PROVIDER=kms). */
+export const SIGNING_KEY_PROVIDER = Symbol('SIGNING_KEY_PROVIDER');
 
 const ORDER: Record<SigningKeyStatus, number> = { ACTIVE: 0, NEXT: 1, RETIRING: 2, RETIRED: 3 };
 
@@ -27,10 +31,10 @@ interface ActiveSigner {
  *   RETIRING  last   -> still published so already-issued tokens verify
  *   RETIRED / revoked -> never published
  *
- * Providers:
- *   file  private JWKs in SIGNING_KEYS_FILE (development only - refused in production)
- *   kms   AWS KMS keys listed in signing_key_metadata (key_provider_ref = kms:<KeyId>); the private
- *         key never leaves KMS, signatures are produced by KMS Sign.
+ * Where the private key set comes from (KEY_PROVIDER) is the SigningKeyProvider's business:
+ *   auto / ssm / file  RS256 private JWKs from SSM Parameter Store or a local file; this process signs
+ *   kms (legacy)       AWS KMS keys listed in signing_key_metadata (key_provider_ref = kms:<KeyId>); the
+ *                      private key never leaves KMS, signatures are produced by KMS Sign.
  */
 @Injectable()
 export class SigningKeyService {
@@ -41,19 +45,26 @@ export class SigningKeyService {
   constructor(
     private readonly config: AppConfig,
     private readonly metadata: SigningKeyRepository,
+    @Optional() @Inject(SIGNING_KEY_PROVIDER) private readonly provider: SigningKeyProvider | null = null,
   ) {}
 
   get usesExternalSigning(): boolean {
-    return this.config.env.SIGNING_KEY_PROVIDER === 'kms';
+    return this.config.env.KEY_PROVIDER === 'kms';
   }
 
   async loadForProvider(): Promise<ProviderKey[]> {
-    return this.usesExternalSigning ? this.loadKms() : this.loadFile();
+    return this.usesExternalSigning ? this.loadKms() : this.loadKeySet();
   }
 
-  private async loadFile(): Promise<ProviderKey[]> {
+  /** RS256 private JWKs from the configured provider (SSM or file); signing happens in this process. */
+  private async loadKeySet(): Promise<ProviderKey[]> {
     const env = this.config.env;
-    const file = await readKeyFile(env.SIGNING_KEYS_FILE);
+    if (!this.provider) throw new Error('no signing key provider configured');
+    const file = await this.provider.getSigningKeys();
+    const source = this.provider.describe();
+    if (env.NODE_ENV === 'production' && this.provider.storage === 'file') {
+      throw new Error(`production signing keys must not come from a local file (${source}); give the service AWS credentials for SSM`);
+    }
     const usable = file.keys.filter((k) => k.status !== 'RETIRED' && !k.revokedAt).sort((a, b) => ORDER[a.status] - ORDER[b.status]);
     this.assertOneActive(usable.map((k) => k.status));
     for (const k of usable) {
@@ -68,7 +79,7 @@ export class SigningKeyService {
         status: k.revokedAt ? 'RETIRED' : k.status,
         jwkThumbprint: await calculateJwkThumbprint(publicJwk, 'sha256'),
         publicJwk: publicJwk as Record<string, unknown>,
-        keyProviderRef: `file:${env.SIGNING_KEYS_FILE}`,
+        keyProviderRef: source,
         purpose: 'OIDC_TOKEN_SIGNING',
         environment: env.NODE_ENV,
         revokedAt: k.revokedAt ? new Date(k.revokedAt) : null,
@@ -78,7 +89,7 @@ export class SigningKeyService {
     const privateKey = createPrivateKey({ key: activeKey.jwk as never, format: 'jwk' });
     this.active = { kid: activeKey.jwk.kid, sign: async (data) => cryptoSign('sha256', data, privateKey) };
     this.published = usable.map((k) => ({ ...toPublicJwk(k.jwk), use: 'sig' }));
-    this.logger.log(`signing keys (file): ${usable.map((k) => `${k.jwk.kid}(${k.status})`).join(', ')}`);
+    this.logger.log(`signing keys (${source}): ${usable.map((k) => `${k.jwk.kid}(${k.status})`).join(', ')}`);
     return usable.map((k) => ({ ...k.jwk, use: 'sig' }));
   }
 
