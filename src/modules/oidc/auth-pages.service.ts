@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { AppConfig } from '../../config/config.module';
 import type { AuthRealm } from '../../database/entities';
+import { CaptchaService } from '../identity/captcha.service';
 import type { CredentialFailure } from '../identity/credential.service';
 import type { MfaOption, StartOtpResult, VerifyResult } from '../mfa/mfa.service';
 import { CsrfService } from '../security/csrf.service';
@@ -36,10 +37,19 @@ export class AuthPagesService {
     private readonly config: AppConfig,
     private readonly csrf: CsrfService,
     private readonly views: ViewService,
+    private readonly captcha: CaptchaService,
   ) {}
 
-  login(req: FastifyRequest, reply: FastifyReply, t: PageTarget, data: { error?: string; info?: string; itsId?: string }, status = 200) {
+  /**
+   * `captcha`: show the Google reCAPTCHA widget (the caller knows whether this ID reached the threshold).
+   * Not given -> shown only when the captcha is on for every login (LOGIN_CAPTCHA_AFTER_FAILURES=0).
+   */
+  login(req: FastifyRequest, reply: FastifyReply, t: PageTarget, data: { error?: string; info?: string; itsId?: string; captcha?: boolean }, status = 200) {
+    const showCaptcha = this.captcha.enabled && (data.captcha ?? this.config.env.LOGIN_CAPTCHA_AFTER_FAILURES === 0);
     return this.send(reply, status, 'login', {
+      captcha: showCaptcha,
+      captchaSiteKey: showCaptcha ? this.captcha.widget.siteKey : '',
+      captchaScriptUrl: showCaptcha ? this.captcha.widget.scriptUrl : '',
       title: 'Login to Continue',
       loginAction: t.actions.login,
       cancelAction: t.actions.cancel,
@@ -114,6 +124,12 @@ export function minutes(seconds: number): string {
   return m <= 1 ? 'a minute' : `${m} minutes`;
 }
 
+/** Short explanation shown when the captcha appears because of earlier failures. */
+export function captchaInfo(r: { captcha: boolean; failure: CredentialFailure }): string | undefined {
+  if (!r.captcha || r.failure.code.startsWith('CAPTCHA_')) return undefined;
+  return 'For your security, please also confirm you are not a robot.';
+}
+
 export function loginFailureMessage(f: CredentialFailure): string {
   switch (f.code) {
     case 'ACCOUNT_LOCKED':
@@ -122,6 +138,12 @@ export function loginFailureMessage(f: CredentialFailure): string {
       return 'Your account cannot sign in at the moment. Please contact your Jamaat office.';
     case 'NOT_ELIGIBLE':
       return f.message;
+    case 'CAPTCHA_REQUIRED':
+      return 'Please confirm you are not a robot, then sign in again.';
+    case 'CAPTCHA_INVALID':
+      return 'The security check failed or expired. Please complete it again.';
+    case 'CAPTCHA_UNAVAILABLE':
+      return 'The security check is not available right now. Please try again in a moment.';
     default:
       return 'Incorrect ITS ID or password.';
   }

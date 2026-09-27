@@ -9,6 +9,9 @@ const bool = (fallback: boolean) =>
 export const CLIENT_AUTH_METHOD_VALUES = ['client_secret_basic', 'private_key_jwt', 'client_secret_post'] as const;
 export type ClientAuthMethod = (typeof CLIENT_AUTH_METHOD_VALUES)[number];
 
+/** Google's public reCAPTCHA v2 test site key: every token passes (development / tests only). */
+export const GOOGLE_TEST_SITE_KEY = '6LeIxAcTAAAAAJcZVRqyHh3cGAvfsmgMEtXlBWLF';
+
 const int = (fallback: number, min = 0) => z.coerce.number().int().min(min).default(fallback);
 
 const csv = z
@@ -60,10 +63,29 @@ export const envSchema = z
     /** true: the ITS ID must be present in user_eligible. false: no eligibility check at all. */
     LOGIN_ELIGIBILITY_CHECK_ENABLED: bool(true),
     LOGIN_NOT_ELIGIBLE_MESSAGE: z.string().default('You are not eligible to sign in. Please contact your Jamaat office.'),
+    /** Temporary account lock after LOGIN_MAX_FAILURES_PER_ACCOUNT wrong passwords (true) or never lock (false). */
+    LOGIN_ACCOUNT_LOCK_ENABLED: bool(true),
     LOGIN_MAX_FAILURES_PER_ACCOUNT: int(5, 1),
     LOGIN_ACCOUNT_LOCK_SECONDS: int(900, 1),
     LOGIN_MAX_ATTEMPTS_PER_IP: int(30, 1),
     LOGIN_IP_WINDOW_SECONDS: int(300, 1),
+
+    // --- Login captcha (Google reCAPTCHA v2 checkbox) ---------------------------------------------
+    /**
+     * After LOGIN_CAPTCHA_AFTER_FAILURES failed logins for the same ITS ID (inside the window, since the last
+     * success) the login page shows a captcha, and the password is not even checked until it is solved. Bots can
+     * then no longer run up failures (and lock accounts) without a human. 0 = always show the captcha.
+     */
+    LOGIN_CAPTCHA_ENABLED: bool(false),
+    LOGIN_CAPTCHA_AFTER_FAILURES: int(3, 0),
+    LOGIN_CAPTCHA_WINDOW_SECONDS: int(3600, 60),
+    RECAPTCHA_SITE_KEY: z.string().default(''),
+    RECAPTCHA_SECRET_KEY: z.string().default(''),
+    RECAPTCHA_VERIFY_URL: z.string().url().default('https://www.google.com/recaptcha/api/siteverify'),
+    RECAPTCHA_SCRIPT_URL: z.string().url().default('https://www.google.com/recaptcha/api.js'),
+    /** Optional: accept only tokens solved on these host names (comma separated), e.g. auth.example.com. */
+    RECAPTCHA_EXPECTED_HOSTNAMES: csv,
+    RECAPTCHA_TIMEOUT_MS: int(5000, 500),
 
     // --- Core realm sessions ----------------------------------------------------------------
     SSO_COOKIE_ADMIN: z.string().default('__Host-miqaat-admin-sso'),
@@ -228,6 +250,12 @@ export const envSchema = z
       }
       if (env.AWS_ENDPOINT_URL) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['AWS_ENDPOINT_URL'], message: 'must be empty in production' });
       if (env.MFA_STATIC_OTP) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['MFA_STATIC_OTP'], message: 'a static OTP is for testing only and must be empty in production' });
+      if (env.LOGIN_CAPTCHA_ENABLED && env.RECAPTCHA_SITE_KEY === GOOGLE_TEST_SITE_KEY) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['RECAPTCHA_SITE_KEY'], message: "Google's reCAPTCHA test key always passes; use a real key in production" });
+      }
+      if (env.LOGIN_CAPTCHA_ENABLED && !env.RECAPTCHA_VERIFY_URL.startsWith('https://')) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['RECAPTCHA_VERIFY_URL'], message: 'must be https in production' });
+      }
     }
     if (env.MFA_STATIC_OTP && env.MFA_STATIC_OTP.length !== env.OTP_LENGTH) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['MFA_STATIC_OTP'], message: `must have OTP_LENGTH (${env.OTP_LENGTH}) digits` });
@@ -237,6 +265,11 @@ export const envSchema = z
     }
     if (env.SMS_TRANSPORT === 'http' && !env.SMS_HTTP_URL) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['SMS_HTTP_URL'], message: 'required when SMS_TRANSPORT=http' });
+    }
+    if (env.LOGIN_CAPTCHA_ENABLED) {
+      for (const key of ['RECAPTCHA_SITE_KEY', 'RECAPTCHA_SECRET_KEY'] as const) {
+        if (!env[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'required when LOGIN_CAPTCHA_ENABLED=true' });
+      }
     }
   })
   // Effective key provider and SSM parameter, so the rest of the code reads one value.

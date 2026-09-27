@@ -22,13 +22,16 @@ async function bootstrap() {
   const fastify = app.getHttpAdapter().getInstance();
 
   await app.register(fastifyCookie);
+  // Login captcha (Google reCAPTCHA v2): its script and iframe come from the script URL's origin + gstatic.
+  const captchaOrigins = config.env.LOGIN_CAPTCHA_ENABLED ? [new URL(config.env.RECAPTCHA_SCRIPT_URL).origin, 'https://www.gstatic.com'] : [];
   // application/x-www-form-urlencoded (the SSR forms) is parsed by Nest's Fastify adapter itself.
   await app.register(fastifyHelmet, {
     contentSecurityPolicy: {
       useDefaults: false,
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],
+        scriptSrc: ["'self'", ...captchaOrigins],
+        frameSrc: captchaOrigins.length ? captchaOrigins : ["'none'"],
         styleSrc: ["'self'", 'https://fonts.googleapis.com'],
         fontSrc: ["'self'", 'https://fonts.gstatic.com'],
         imgSrc: ["'self'", 'data:'],

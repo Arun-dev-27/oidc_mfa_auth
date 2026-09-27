@@ -51,4 +51,28 @@ export class LoginAttemptRepository {
     );
     return { failures: row?.failures ?? 0, secondsSinceLast: row?.seconds_since_last ?? null };
   }
+
+  /**
+   * Failed password logins for one typed identifier (identifier_hash) since its last successful login,
+   * inside the window. Counts unknown / inactive IDs too, so a captcha appears for any ID after the same
+   * number of failures and cannot reveal which ITS IDs exist.
+   */
+  async recentIdentifierFailures(identifierHash: string, reasons: string[], windowSeconds: number): Promise<number> {
+    const [row] = await this.attempts.query(
+      `WITH last_ok AS (
+         SELECT max(created_at) AS at FROM auth_login_attempts
+          WHERE identifier_hash = $1 AND success AND COALESCE(attempt_type, 'LOGIN') = 'LOGIN'
+       )
+       SELECT count(*)::int AS failures
+         FROM auth_login_attempts, last_ok
+        WHERE identifier_hash = $1
+          AND NOT success
+          AND COALESCE(attempt_type, 'LOGIN') = 'LOGIN'
+          AND failure_reason = ANY($2::text[])
+          AND created_at > now() - make_interval(secs => $3)
+          AND (last_ok.at IS NULL OR created_at > last_ok.at)`,
+      [identifierHash, reasons, windowSeconds],
+    );
+    return row?.failures ?? 0;
+  }
 }

@@ -13,7 +13,7 @@ import { ACR_AAL1, ACR_AAL2, MfaService, type MfaOption, type StartOtpResult, ty
 import { CsrfService } from '../security/csrf.service';
 import { RateLimitService } from '../security/rate-limit.service';
 import { GlobalSessionService, type RealmSession } from '../sessions/global-session.service';
-import { AuthPagesService, loginFailureMessage, minutes, startFailureMessage, verifyFailureMessage, type PageTarget } from './auth-pages.service';
+import { AuthPagesService, captchaInfo, loginFailureMessage, minutes, startFailureMessage, verifyFailureMessage, type PageTarget } from './auth-pages.service';
 import { ClientRegistryService } from './client-registry.service';
 import { signinActions } from './signin-paths';
 import { grantContextKey, OIDC_PROVIDER, sessionGrantsKey, type GrantContext, type OidcProvider } from './oidc.constants';
@@ -35,6 +35,8 @@ export interface LoginForm {
   its_id?: string;
   password?: string;
   csrf?: string;
+  /** Google reCAPTCHA token (present when the widget was shown). */
+  'g-recaptcha-response'?: string;
 }
 
 export interface MfaForm {
@@ -99,23 +101,29 @@ export class InteractionService {
     const ctx = await this.context(req, reply, uid);
     if (!ctx) return;
     const itsIdInput = (form.its_id ?? '').trim().slice(0, 32);
+    // Re-shown forms keep the captcha when this ID already needs it.
+    const captcha = () => this.credentials.captchaRequiredFor(itsIdInput);
     if (!this.csrf.verify(req, uid, form.csrf)) {
-      return this.renderLogin(req, reply, ctx, { error: 'Your sign-in form expired. Please try again.', itsId: itsIdInput }, 403);
+      return this.renderLogin(req, reply, ctx, { error: 'Your sign-in form expired. Please try again.', itsId: itsIdInput, captcha: await captcha() }, 403);
     }
     const env = this.config.env;
     const meta = requestMeta(req);
     const ipLimit = await this.rateLimit.hit('login-ip', meta.ip, env.LOGIN_MAX_ATTEMPTS_PER_IP, env.LOGIN_IP_WINDOW_SECONDS);
     if (!ipLimit.allowed) {
-      return this.renderLogin(req, reply, ctx, { error: `Too many attempts. Try again in ${minutes(ipLimit.retryAfter)}.`, itsId: itsIdInput }, 429);
+      return this.renderLogin(req, reply, ctx, { error: `Too many attempts. Try again in ${minutes(ipLimit.retryAfter)}.`, itsId: itsIdInput, captcha: await captcha() }, 429);
     }
     if (!itsIdInput || !form.password) {
-      return this.renderLogin(req, reply, ctx, { error: 'Enter your ITS ID and password.', itsId: itsIdInput }, 400);
+      return this.renderLogin(req, reply, ctx, { error: 'Enter your ITS ID and password.', itsId: itsIdInput, captcha: await captcha() }, 400);
     }
 
-    const result = await this.credentials.verifyPassword(itsIdInput, form.password.slice(0, 256), { ip: meta.ip, clientId: ctx.clientId });
+    const result = await this.credentials.verifyPassword(itsIdInput, form.password.slice(0, 256), {
+      ip: meta.ip,
+      clientId: ctx.clientId,
+      captchaToken: form['g-recaptcha-response'],
+    });
     if (!result.ok) {
-      await this.audit.record({ eventType: 'LOGIN_FAILURE', outcome: 'FAILURE', itsId: result.itsId, clientId: ctx.clientId, metadata: { reason: result.failure.code }, ...meta });
-      return this.renderLogin(req, reply, ctx, { error: loginFailureMessage(result.failure), itsId: itsIdInput }, 401);
+      await this.audit.record({ eventType: 'LOGIN_FAILURE', outcome: 'FAILURE', itsId: result.itsId, clientId: ctx.clientId, metadata: { reason: result.failure.code, ...(result.captcha ? { captcha: true } : {}) }, ...meta });
+      return this.renderLogin(req, reply, ctx, { error: loginFailureMessage(result.failure), info: captchaInfo(result), itsId: itsIdInput, captcha: result.captcha }, 401);
     }
 
     // Always a brand-new session and cookie secret after a password login (no fixation).
@@ -294,7 +302,7 @@ export class InteractionService {
     return { actions: signinActions(ctx.uid), csrfScope: ctx.uid, clientName: ctx.clientName, realm: ctx.realm };
   }
 
-  private renderLogin(req: FastifyRequest, reply: FastifyReply, ctx: InteractionContext, data: { error?: string; info?: string; itsId?: string }, status = 200) {
+  private renderLogin(req: FastifyRequest, reply: FastifyReply, ctx: InteractionContext, data: { error?: string; info?: string; itsId?: string; captcha?: boolean }, status = 200) {
     return this.pages.login(req, reply, this.page(ctx), data, status);
   }
 

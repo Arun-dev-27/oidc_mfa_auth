@@ -11,7 +11,7 @@ import { AuditService } from '../audit/audit.service';
 import { CredentialService, type Member } from '../identity/credential.service';
 import { SigningKeyService } from '../keys/signing-key.service';
 import { ACR_AAL1, ACR_AAL2, MfaService, type MfaOption } from '../mfa/mfa.service';
-import { AuthPagesService, loginFailureMessage, minutes, startFailureMessage, verifyFailureMessage, type FormActions, type PageTarget } from '../oidc/auth-pages.service';
+import { AuthPagesService, captchaInfo, loginFailureMessage, minutes, startFailureMessage, verifyFailureMessage, type FormActions, type PageTarget } from '../oidc/auth-pages.service';
 import { ClientAuthService } from '../oidc/client-auth.service';
 import { CsrfService } from '../security/csrf.service';
 import { RateLimitService } from '../security/rate-limit.service';
@@ -134,19 +134,24 @@ export class HandoffService {
     const pending = await this.pending(reply, id);
     if (!pending) return;
     const itsIdInput = (form.its_id ?? '').trim().slice(0, 32);
+    const captcha = () => this.credentials.captchaRequiredFor(itsIdInput);
     if (!this.csrf.verify(req, pending.page.csrfScope, form.csrf)) {
-      return this.pages.login(req, reply, pending.page, { error: 'Your sign-in form expired. Please try again.', itsId: itsIdInput }, 403);
+      return this.pages.login(req, reply, pending.page, { error: 'Your sign-in form expired. Please try again.', itsId: itsIdInput, captcha: await captcha() }, 403);
     }
     const env = this.config.env;
     const meta = requestMeta(req);
     const ipLimit = await this.rateLimit.hit('login-ip', meta.ip, env.LOGIN_MAX_ATTEMPTS_PER_IP, env.LOGIN_IP_WINDOW_SECONDS);
-    if (!ipLimit.allowed) return this.pages.login(req, reply, pending.page, { error: `Too many attempts. Try again in ${minutes(ipLimit.retryAfter)}.`, itsId: itsIdInput }, 429);
-    if (!itsIdInput || !form.password) return this.pages.login(req, reply, pending.page, { error: 'Enter your ITS ID and password.', itsId: itsIdInput }, 400);
+    if (!ipLimit.allowed) return this.pages.login(req, reply, pending.page, { error: `Too many attempts. Try again in ${minutes(ipLimit.retryAfter)}.`, itsId: itsIdInput, captcha: await captcha() }, 429);
+    if (!itsIdInput || !form.password) return this.pages.login(req, reply, pending.page, { error: 'Enter your ITS ID and password.', itsId: itsIdInput, captcha: await captcha() }, 400);
 
-    const result = await this.credentials.verifyPassword(itsIdInput, form.password.slice(0, 256), { ip: meta.ip, clientId: pending.target.clientId });
+    const result = await this.credentials.verifyPassword(itsIdInput, form.password.slice(0, 256), {
+      ip: meta.ip,
+      clientId: pending.target.clientId,
+      captchaToken: form['g-recaptcha-response'],
+    });
     if (!result.ok) {
-      await this.audit.record({ eventType: 'LOGIN_FAILURE', outcome: 'FAILURE', itsId: result.itsId, clientId: pending.target.clientId, metadata: { reason: result.failure.code, via: 'handoff' }, ...meta });
-      return this.pages.login(req, reply, pending.page, { error: loginFailureMessage(result.failure), itsId: itsIdInput }, 401);
+      await this.audit.record({ eventType: 'LOGIN_FAILURE', outcome: 'FAILURE', itsId: result.itsId, clientId: pending.target.clientId, metadata: { reason: result.failure.code, via: 'handoff', ...(result.captcha ? { captcha: true } : {}) }, ...meta });
+      return this.pages.login(req, reply, pending.page, { error: loginFailureMessage(result.failure), info: captchaInfo(result), itsId: itsIdInput, captcha: result.captcha }, 401);
     }
     const session = await this.sessions.create(pending.request.authRealm, result.member.itsId, meta, reply);
     await this.audit.record({ eventType: 'LOGIN_SUCCESS', outcome: 'SUCCESS', itsId: result.member.itsId, sid: session.sid, clientId: pending.target.clientId, metadata: { realm: pending.request.authRealm, via: 'handoff' }, ...meta });

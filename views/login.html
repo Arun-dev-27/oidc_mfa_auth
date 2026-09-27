@@ -32,8 +32,16 @@
 
   {{#forgotUrl}}<div class="row-end"><a class="link" href="{{forgotUrl}}">Forgot password?</a></div>{{/forgotUrl}}
 
+  {{#captcha}}
+  <div class="captcha" data-captcha>
+    <div class="g-recaptcha" data-sitekey="{{captchaSiteKey}}"></div>
+    <p class="captcha-help" data-captcha-help hidden>Please tick "I'm not a robot" first.</p>
+  </div>
+  {{/captcha}}
+
   <button type="submit" class="button" data-submit>Login</button>
 </form>
+{{#captcha}}<script src="{{captchaScriptUrl}}" async defer></script>{{/captcha}}
 
 <form method="post" action="{{cancelAction}}" class="cancel-form">
   <input type="hidden" name="csrf" value="{{csrf}}" />

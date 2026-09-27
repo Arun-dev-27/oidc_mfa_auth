@@ -15,7 +15,7 @@
  */
 import 'reflect-metadata';
 import { spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { readdir, readFile, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -365,6 +365,37 @@ async function startSmsMock(port: number): Promise<SmsMock> {
       const json = JSON.parse(body || '{}');
       mock.messages.push({ ...json, auth: req.headers.authorization ?? '' });
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ id: `mock-${mock.messages.length}` }));
+    });
+  });
+  await new Promise<void>((r) => mock.server.listen(port, '127.0.0.1', () => r()));
+  return mock;
+}
+
+/** Fake of Google's reCAPTCHA siteverify: "good" passes (hostname localhost), "good-otherhost" passes on another host, anything else fails. */
+interface RecaptchaMock {
+  server: Server;
+  down: boolean;
+  calls: { secret: string; response: string; remoteip: string }[];
+}
+
+async function startRecaptchaMock(port: number): Promise<RecaptchaMock> {
+  const mock: RecaptchaMock = { server: undefined as unknown as Server, down: false, calls: [] };
+  mock.server = createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      if (mock.down) {
+        res.writeHead(503).end('unavailable');
+        return;
+      }
+      const form = new URLSearchParams(body);
+      const call = { secret: form.get('secret') ?? '', response: form.get('response') ?? '', remoteip: form.get('remoteip') ?? '' };
+      mock.calls.push(call);
+      const ok = call.secret === 'e2e-secret' && call.response.startsWith('good');
+      const out = ok
+        ? { success: true, hostname: call.response === 'good-otherhost' ? 'evil.example' : 'localhost', challenge_ts: new Date().toISOString() }
+        : { success: false, 'error-codes': [call.response === 'expired' ? 'timeout-or-duplicate' : 'invalid-input-response'] };
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
     });
   });
   await new Promise<void>((r) => mock.server.listen(port, '127.0.0.1', () => r()));
@@ -792,6 +823,250 @@ async function main() {
       check('4th login from the same IP within the window -> 429', statuses[3] === 429 && /Too many attempts/.test(last?.alert ?? ''), statuses.join(','));
     });
   });
+
+  // ------------------------------------------------------------------------------------------------
+  // Login captcha (Google reCAPTCHA v2) after N failures, against a local fake of Google's siteverify.
+  const recaptcha = await startRecaptchaMock(4998);
+  const CAPTCHA = {
+    LOGIN_CAPTCHA_ENABLED: 'true',
+    LOGIN_CAPTCHA_AFTER_FAILURES: '3',
+    RECAPTCHA_SITE_KEY: 'e2e-site-key',
+    RECAPTCHA_SECRET_KEY: 'e2e-secret',
+    RECAPTCHA_VERIFY_URL: 'http://127.0.0.1:4998/siteverify',
+    RECAPTCHA_EXPECTED_HOSTNAMES: 'localhost',
+    LOGIN_MAX_FAILURES_PER_ACCOUNT: '6',
+    LOGIN_ACCOUNT_LOCK_SECONDS: '120',
+  };
+  const hasCaptcha = (p?: Page) => Boolean(p?.html.includes('data-sitekey="e2e-site-key"') && p.html.includes('https://www.google.com/recaptcha/api.js'));
+  const clearAttempts = (...ids: string[]) =>
+    AppDataSource.query(`DELETE FROM auth_login_attempts WHERE its_id = ANY($1) OR identifier_hash = ANY($2)`, [ids, ids.map((id) => createHash('sha256').update(`ITS:${id}`).digest('hex'))]);
+  const failures = async (itsId: string, reason: string) =>
+    Number((await AppDataSource.query(`SELECT count(*)::int AS n FROM auth_login_attempts WHERE its_id = $1 AND failure_reason = $2`, [itsId, reason]))[0].n);
+  /** One login submit from a fresh browser; `token` = the g-recaptcha-response the widget would post. */
+  const tryLogin = async (itsId: string, password: string, token?: string) => {
+    const b = new Browser();
+    const { step } = await start(b, clients.admin, {});
+    return submitLogin(b, step.page!, clients.admin, itsId, password, token === undefined ? {} : { 'g-recaptcha-response': token });
+  };
+  const UNKNOWN_ID = '99999991';
+  await profile('3b. Login captcha after 3 failures (reCAPTCHA)', CAPTCHA, async () => {
+    const who = M.lockout;
+    const pw = passwords.get(who)!;
+    await clearAttempts(who, M.plain, UNKNOWN_ID);
+
+    await scenario('captcha appears after the 3rd failure', async () => {
+      const b = new Browser();
+      const first = await start(b, clients.admin, {});
+      check('first login page: no captcha', first.step.page?.kind === 'login' && !hasCaptcha(first.step.page));
+      const csp = first.step.page?.headers.get('content-security-policy') ?? '';
+      check('CSP allows the reCAPTCHA script and frame (google.com + gstatic.com)', /script-src[^;]*https:\/\/www\.google\.com[^;]*https:\/\/www\.gstatic\.com/.test(csp) && /frame-src[^;]*https:\/\/www\.google\.com/.test(csp), csp);
+      const f1 = await tryLogin(who, 'wrong-1');
+      const f2 = await tryLogin(who, 'wrong-2');
+      check('failures 1 and 2: "Incorrect ITS ID or password.", no captcha yet', f1.page?.alert === 'Incorrect ITS ID or password.' && !hasCaptcha(f1.page) && !hasCaptcha(f2.page));
+      const f3 = await tryLogin(who, 'wrong-3');
+      check('failure 3: captcha shown with an explanation', hasCaptcha(f3.page) && Boolean(f3.page?.html.includes('please also confirm you are not a robot')), f3.page?.alert);
+      const again = await start(new Browser(), clients.admin, {});
+      check('a fresh login page does not know the ID yet: no captcha until the ID is submitted', !hasCaptcha(again.step.page));
+    });
+
+    await scenario('without the captcha the password is not even checked', async () => {
+      const calls = recaptcha.calls.length;
+      const r = await tryLogin(who, pw);
+      check('correct password but no captcha -> refused, captcha shown again', r.page?.kind === 'login' && /not a robot/.test(r.page?.alert ?? '') && hasCaptcha(r.page), r.page?.alert);
+      check('no token -> Google is not called', recaptcha.calls.length === calls);
+      check('recorded as CAPTCHA_REQUIRED, not as a wrong password', (await failures(who, 'CAPTCHA_REQUIRED')) === 1 && (await failures(who, 'INVALID_PASSWORD')) === 3);
+    });
+
+    await scenario('a bot cannot lock the account', async () => {
+      for (let i = 0; i < 8; i++) await tryLogin(who, `bot-guess-${i}`);
+      check('8 more bot guesses without captcha: all refused, wrong-password count still 3', (await failures(who, 'INVALID_PASSWORD')) === 3 && (await failures(who, 'CAPTCHA_REQUIRED')) === 9);
+      check('account is NOT locked (lock needs 6 checked wrong passwords)', (await failures(who, 'ACCOUNT_TEMPORARILY_LOCKED')) === 0);
+    });
+
+    await scenario('invalid, expired or wrong-host captcha', async () => {
+      const bad = await tryLogin(who, pw, 'expired');
+      check('expired token -> "The security check failed or expired", no login', bad.page?.kind === 'login' && /failed or expired/.test(bad.page?.alert ?? '') && hasCaptcha(bad.page), bad.page?.alert);
+      const call = recaptcha.calls.at(-1);
+      check('server verified with Google: secret, response and remoteip posted', call?.secret === 'e2e-secret' && call?.response === 'expired' && Boolean(call?.remoteip), JSON.stringify(call));
+      const host = await tryLogin(who, pw, 'good-otherhost');
+      check('valid token solved on another host -> refused (RECAPTCHA_EXPECTED_HOSTNAMES)', host.page?.kind === 'login' && /failed or expired/.test(host.page?.alert ?? ''));
+      check('recorded as CAPTCHA_INVALID', (await failures(who, 'CAPTCHA_INVALID')) === 2);
+    });
+
+    await scenario('with a valid captcha the password is checked', async () => {
+      const wrong = await tryLogin(who, 'wrong-4', 'good');
+      check('valid captcha + wrong password -> "Incorrect…", counted (4), captcha stays', wrong.page?.alert === 'Incorrect ITS ID or password.' && (await failures(who, 'INVALID_PASSWORD')) === 4 && hasCaptcha(wrong.page));
+      const ok = await tryLogin(who, pw, 'good');
+      check('valid captcha + correct password -> signed in (back to the app with a code)', Boolean(ok.callback?.searchParams.get('code')), ok.page?.alert);
+      const after = await tryLogin(who, 'wrong-after-success');
+      check('a successful login resets the count: next failure shows no captcha', after.page?.alert === 'Incorrect ITS ID or password.' && !hasCaptcha(after.page));
+    });
+
+    await scenario('account lock still works (configurable)', async () => {
+      const id = M.plain;
+      let last: Page | undefined;
+      for (let i = 1; i <= 6; i++) last = (await tryLogin(id, `wrong-${i}`, i > 3 ? 'good' : undefined)).page;
+      const locked = await tryLogin(id, passwords.get(id)!, 'good');
+      check('6 checked wrong passwords (captcha solved after the 3rd) -> account locked', /Too many incorrect attempts/.test(locked.page?.alert ?? ''), `${last?.alert} | ${locked.page?.alert}`);
+      await clearAttempts(id);
+    });
+
+    await scenario('unknown ITS IDs get the captcha too (no account probing)', async () => {
+      for (let i = 1; i <= 2; i++) await tryLogin(UNKNOWN_ID, `x-${i}`);
+      const third = await tryLogin(UNKNOWN_ID, 'x-3');
+      check('unknown ID: captcha after the same 3 failures as a real account', hasCaptcha(third.page) && third.page?.alert === 'Incorrect ITS ID or password.');
+    });
+
+    await scenario('Google unreachable -> fail closed', async () => {
+      await clearAttempts(who);
+      for (let i = 1; i <= 3; i++) await tryLogin(who, `wrong-${i}`);
+      recaptcha.down = true;
+      const down = await tryLogin(who, pw, 'good');
+      recaptcha.down = false;
+      check('verification service down: login refused ("not available right now"), not skipped', down.page?.kind === 'login' && /not available right now/.test(down.page?.alert ?? ''), down.page?.alert);
+      check('recorded as CAPTCHA_UNAVAILABLE', (await failures(who, 'CAPTCHA_UNAVAILABLE')) === 1);
+    });
+
+    await scenario('captcha is per ITS ID, and only within the window', async () => {
+      await clearAttempts(who, M.plain);
+      for (let i = 1; i <= 3; i++) await tryLogin(who, `wrong-${i}`);
+      const other = await tryLogin(M.plain, 'wrong-other');
+      check('another ITS ID without failures: no captcha while this one needs it', !hasCaptcha(other.page) && hasCaptcha((await tryLogin(who, 'wrong-4')).page));
+      await AppDataSource.query(`UPDATE auth_login_attempts SET created_at = now() - interval '2 hours' WHERE its_id = $1`, [who]);
+      const later = await tryLogin(who, 'wrong-later');
+      check('failures older than LOGIN_CAPTCHA_WINDOW_SECONDS no longer count: no captcha', later.page?.alert === 'Incorrect ITS ID or password.' && !hasCaptcha(later.page));
+      await clearAttempts(who, M.plain);
+    });
+
+    await scenario('error pages keep the captcha for that ID', async () => {
+      for (let i = 1; i <= 3; i++) await tryLogin(who, `wrong-${i}`);
+      const b = new Browser();
+      const { step } = await start(b, clients.admin, {});
+      const empty = await submitLogin(b, step.page!, clients.admin, who, '');
+      check('empty password -> "Enter your ITS ID and password." with the captcha', /Enter your ITS ID and password/.test(empty.page?.alert ?? '') && hasCaptcha(empty.page), empty.page?.alert);
+      const b2 = new Browser();
+      const s2 = await start(b2, clients.admin, {});
+      const csrf = await submitLogin(b2, { ...s2.step.page!, csrf: 'forged' }, clients.admin, who, pw);
+      check('expired / forged form (CSRF) -> "form expired" with the captcha', csrf.page?.status === 403 && hasCaptcha(csrf.page), `${csrf.page?.status} ${csrf.page?.alert}`);
+    });
+
+    await scenario('MFA still follows a captcha sign-in', async () => {
+      // A member with an email factor (M.lockout has no email / factor, so MFA is impossible for it).
+      const mfaMember = M.plain;
+      await clearAttempts(mfaMember);
+      for (let i = 1; i <= 3; i++) await tryLogin(mfaMember, `wrong-${i}`);
+      const b = new Browser();
+      const { step } = await start(b, clients.admin, { acr: 'urn:miqaat:aal:2' });
+      const r = await submitLogin(b, step.page!, clients.admin, mfaMember, passwords.get(mfaMember)!, { 'g-recaptcha-response': 'good' });
+      check('Sign in + MFA with a solved captcha -> code page next', r.page?.kind === 'mfa', `${r.page?.kind} ${r.page?.alert}`);
+      await clearAttempts(who, mfaMember);
+    });
+
+    await scenario('audit trail', async () => {
+      const rows = await AppDataSource.query(
+        `SELECT metadata->>'reason' AS reason, metadata->>'captcha' AS captcha FROM auth_audit_events
+          WHERE event_type = 'LOGIN_FAILURE' AND its_id = $1 AND created_at > now() - interval '15 minutes'`,
+        [who],
+      );
+      const reasons = new Set(rows.map((r: { reason: string }) => r.reason));
+      check('LOGIN_FAILURE events carry CAPTCHA_REQUIRED / CAPTCHA_INVALID / CAPTCHA_UNAVAILABLE reasons', ['CAPTCHA_REQUIRED', 'CAPTCHA_INVALID', 'CAPTCHA_UNAVAILABLE'].every((r) => reasons.has(r)), [...reasons].join(','));
+      check('failures that turned the captcha on are flagged (metadata.captcha = true)', rows.some((r: { captcha: string | null; reason: string }) => r.captcha === 'true' && r.reason === 'INVALID_CREDENTIALS'));
+    });
+
+    await scenario('handoff login page has the same captcha rule', async () => {
+      await clearAttempts(who);
+      for (let i = 1; i <= 3; i++) await tryLogin(who, `wrong-${i}`);
+      const basic =`Basic ${Buffer.from(`${clients.admin.clientId}:${clients.admin.secret}`).toString('base64')}`;
+      const openLogin = async () => {
+        const r = await fetch(`${ISSUER}/v1/handoff/requests`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: basic }, body: JSON.stringify({ target_client_id: clients.admin2.clientId, requested_path: '/events/123' }) });
+        const url = ((await r.json()) as { browser_redirect_url: string }).browser_redirect_url;
+        const b = new Browser();
+        return { b, step: await follow(b, await b.fetch(url), 'http://never/') };
+      };
+      const { b, step } = await openLogin();
+      check('handoff without a Core session -> Core login page (handoff form)', step.page?.kind === 'login' && step.page.actions.login.startsWith('/v1/handoff/'));
+      const refused = await submitLogin(b, step.page!, { clientId: '', redirectUri: 'http://never/' }, who, pw);
+      check('ID already needs the captcha -> handoff login refused without it, captcha shown', refused.page?.kind === 'login' && /not a robot/.test(refused.page?.alert ?? '') && hasCaptcha(refused.page), refused.page?.alert);
+      const again = await openLogin();
+      const done = await submitLogin(again.b, again.step.page!, { clientId: '', redirectUri: 'http://never/' }, who, pw, { 'g-recaptcha-response': 'good' });
+      check('with a valid captcha: handoff continues to the target (auto-POST assertion)', done.page?.kind === 'handoff', done.page?.kind);
+      await clearAttempts(who, UNKNOWN_ID);
+    });
+  });
+
+  await profile('3c. Account lock switched off (LOGIN_ACCOUNT_LOCK_ENABLED=false)', { LOGIN_ACCOUNT_LOCK_ENABLED: 'false', LOGIN_MAX_FAILURES_PER_ACCOUNT: '3' }, async () => {
+    await scenario('never locks', async () => {
+      await clearAttempts(M.lockout);
+      let last: Page | undefined;
+      for (let i = 1; i <= 6; i++) last = (await tryLogin(M.lockout, `wrong-${i}`)).page;
+      check('6 wrong passwords with the lock off: still "Incorrect…", never locked', last?.alert === 'Incorrect ITS ID or password.' && (await failures(M.lockout, 'ACCOUNT_TEMPORARILY_LOCKED')) === 0);
+      const ok = await tryLogin(M.lockout, passwords.get(M.lockout)!);
+      check('correct password still signs in', Boolean(ok.callback?.searchParams.get('code')));
+      check('captcha off (default): no widget on any page', !hasCaptcha(last));
+      const csp = (await start(new Browser(), clients.admin, {})).step.page?.headers.get('content-security-policy') ?? '';
+      // (fonts.gstatic.com in font-src is the page's web font, not reCAPTCHA)
+      check("captcha off: CSP script-src 'self' only, frame-src 'none', no www.google.com", /script-src 'self';/.test(csp) && /frame-src 'none'/.test(csp) && !csp.includes('www.google.com') && !csp.includes('www.gstatic.com'), csp);
+      await clearAttempts(M.lockout);
+    });
+  });
+
+  await profile('3d. Captcha on every login (LOGIN_CAPTCHA_AFTER_FAILURES=0)', { ...CAPTCHA, LOGIN_CAPTCHA_AFTER_FAILURES: '0' }, async () => {
+    await scenario('always', async () => {
+      const b = new Browser();
+      const { step } = await start(b, clients.admin, {});
+      check('the very first login page already shows the captcha', hasCaptcha(step.page));
+      const none = await submitLogin(b, step.page!, clients.admin, M.plain, passwords.get(M.plain)!);
+      check('first attempt without the captcha is refused', /not a robot/.test(none.page?.alert ?? ''));
+      const ok = await tryLogin(M.plain, passwords.get(M.plain)!, 'good');
+      check('with the captcha: signed in', Boolean(ok.callback?.searchParams.get('code')));
+      await clearAttempts(M.plain);
+    });
+  });
+  await profile('3e. Captcha + per-IP limit', { ...CAPTCHA, LOGIN_MAX_ATTEMPTS_PER_IP: '4' }, async () => {
+    await scenario('429 page keeps the captcha', async () => {
+      await clearAttempts(M.lockout);
+      for (let i = 1; i <= 4; i++) await tryLogin(M.lockout, `wrong-${i}`, i > 3 ? 'good' : undefined);
+      const limited = await tryLogin(M.lockout, 'wrong-5', 'good');
+      check('5th attempt from the IP -> 429 "Too many attempts", captcha still shown', limited.page?.status === 429 && /Too many attempts/.test(limited.page?.alert ?? '') && hasCaptcha(limited.page), `${limited.page?.status} ${limited.page?.alert}`);
+      await clearAttempts(M.lockout);
+    });
+  });
+
+  // Production start-up refuses unsafe captcha settings (checked before anything else starts).
+  group = '3f. Production start-up with captcha settings';
+  console.log(`\n=== ${group}`);
+  {
+    const prod = {
+      ...process.env,
+      NODE_ENV: 'production',
+      ISSUER: 'https://auth.example.com',
+      COOKIE_SECURE: 'true',
+      SSO_COOKIE_ADMIN: '__Host-miqaat-admin-sso',
+      SSO_COOKIE_MUMIN: '__Host-miqaat-mumin-sso',
+      EMAIL_TRANSPORT: 'smtp',
+      SMTP_HOST: 'smtp.example.com',
+      SMS_TRANSPORT: 'disabled',
+      MFA_STATIC_OTP: '',
+      AWS_ENDPOINT_URL: '',
+      KEY_PROVIDER: 'ssm',
+      LOGIN_CAPTCHA_ENABLED: 'true',
+      RECAPTCHA_SITE_KEY: 'prod-site-key',
+      RECAPTCHA_SECRET_KEY: 'prod-secret',
+    };
+    const boot = (extra: Record<string, string>) => {
+      const r = spawnSync(process.execPath, ['dist/main.js'], { env: { ...prod, ...extra, PORT: '4097' }, encoding: 'utf8', timeout: 20_000 });
+      return `${r.stdout}${r.stderr}`;
+    };
+    const testKey = boot({ RECAPTCHA_SITE_KEY: '6LeIxAcTAAAAAJcZVRqyHh3cGAvfsmgMEtXlBWLF' });
+    check("production refuses to start with Google's always-pass test site key", /Invalid configuration[\s\S]*RECAPTCHA_SITE_KEY/.test(testKey), testKey.slice(0, 200));
+    const httpVerify = boot({ RECAPTCHA_VERIFY_URL: 'http://verify.local/siteverify' });
+    check('production refuses an http verify URL', /Invalid configuration[\s\S]*RECAPTCHA_VERIFY_URL/.test(httpVerify), httpVerify.slice(0, 200));
+    const noKeys = boot({ RECAPTCHA_SITE_KEY: '', RECAPTCHA_SECRET_KEY: '' });
+    check('captcha enabled without keys is refused', /RECAPTCHA_SITE_KEY: required[\s\S]*RECAPTCHA_SECRET_KEY: required/.test(noKeys), noKeys.slice(0, 200));
+    const good = boot({});
+    check('valid production captcha settings pass validation (start-up then stops at the SSM key load, not at config)', !/Invalid configuration/.test(good), good.slice(0, 200));
+  }
+  recaptcha.server.close();
 
   // ------------------------------------------------------------------------------------------------
   await profile('4. Eligibility check switched off', { LOGIN_ELIGIBILITY_CHECK_ENABLED: 'false' }, async () => {

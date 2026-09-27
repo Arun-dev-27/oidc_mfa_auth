@@ -47,6 +47,18 @@
       });
     });
 
+    // Captcha shown: ask for the tick before posting (the server checks the token anyway).
+    var captcha = form.querySelector('[data-captcha]');
+    form.addEventListener('submit', function (event) {
+      if (!captcha || !window.grecaptcha || typeof window.grecaptcha.getResponse !== 'function') return;
+      if (window.grecaptcha.getResponse() === '') {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        var help = captcha.querySelector('[data-captcha-help]');
+        if (help) help.hidden = false;
+      }
+    });
+
     // No double submit.
     form.addEventListener('submit', function () {
       if (submit) {

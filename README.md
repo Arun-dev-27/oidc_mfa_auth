@@ -90,14 +90,36 @@ test/unit.spec.ts
 
 ## Login rules (existing identity tables)
 
+0. **captcha** (`LOGIN_CAPTCHA_ENABLED=true`): after `LOGIN_CAPTCHA_AFTER_FAILURES` (3) failed logins for the
+   same ITS ID the page shows Google reCAPTCHA v2 and nothing else is checked until it is solved (see below)
 1. `users` JOIN `mumin_master` on `mumin_id`, `status_id = ACTIVE_STATUS_ID` (3), not deleted at source
-2. account lockout: `LOGIN_MAX_FAILURES_PER_ACCOUNT` wrong passwords in `LOGIN_ACCOUNT_LOCK_SECONDS`
+2. account lockout (`LOGIN_ACCOUNT_LOCK_ENABLED`, default on): `LOGIN_MAX_FAILURES_PER_ACCOUNT` wrong passwords in `LOGIN_ACCOUNT_LOCK_SECONDS`
 3. password: legacy `Decrypt(users.password)` (byte-for-byte port of the C# code)
 4. `COALESCE(users.allow_login, true)`
 5. **eligibility**: `LOGIN_ELIGIBILITY_CHECK_ENABLED=true` → the ITS ID must be in `user_eligible`;
    `false` → no eligibility check at all
 
 Allow-login and eligibility messages are only shown after a correct password.
+
+### Login captcha after repeated failures
+
+```text
+failure 1, 2            "Incorrect ITS ID or password."
+failure 3               + Google reCAPTCHA shown ("please also confirm you are not a robot")
+next submit, no captcha refused (CAPTCHA_REQUIRED) - the password is NOT checked, nothing counted
+captcha invalid/expired refused (CAPTCHA_INVALID)
+Google unreachable      refused (CAPTCHA_UNAVAILABLE) - fails closed, never skipped
+captcha OK              password checked as usual: wrong -> counted (lock still applies), right -> signed in
+successful login        count reset, no captcha next time
+```
+
+* Counted per typed ITS ID (unknown IDs too, so the captcha reveals nothing), within
+  `LOGIN_CAPTCHA_WINDOW_SECONDS` and since the last successful login. `LOGIN_CAPTCHA_AFTER_FAILURES=0` = always.
+* Same rule on the handoff login page. The account lock is unchanged and can be switched off with
+  `LOGIN_ACCOUNT_LOCK_ENABLED=false`.
+* Keys from https://www.google.com/recaptcha/admin (reCAPTCHA v2 checkbox; add each login host name, e.g. `localhost`):
+  `RECAPTCHA_SITE_KEY`, `RECAPTCHA_SECRET_KEY`; optional `RECAPTCHA_EXPECTED_HOSTNAMES`. The CSP allows
+  google.com / gstatic.com only while the captcha is enabled. Google's public test key is refused in production.
 
 ## MFA
 
